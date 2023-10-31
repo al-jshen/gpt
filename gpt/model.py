@@ -1,13 +1,12 @@
+import numpy as np
 import torch
 import lightning.pytorch as pl
-
 import torch.nn as nn
 import torch.nn.functional as F
-
 from functorch.einops import rearrange
 
 
-class CausalSelfAttention(nn.Module):
+class Attention(nn.Module):
     def __init__(self, num_heads=12, embed_dim=768, dropout=0.1):
         super().__init__()
 
@@ -36,7 +35,7 @@ class CausalSelfAttention(nn.Module):
 
         # Scale dot product attention, attend over T dim (2nd last)
         y = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True
+            q, k, v, dropout_p=self.dropout if self.training else 0.0
         )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
 
         # Project back to embedding dimension
@@ -50,30 +49,27 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, dropout=0.1):
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
-        self.fc1 = nn.Linear(dim, dim * 4)
-        self.fc2 = nn.Linear(dim * 4, dim)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.GELU()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+        )
 
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        x = self.dropout(x)
-        return x
+        return self.net(x)
 
 
-class Block(nn.Module):
-    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1):
+class TransformerBlock(nn.Module):
+    def __init__(self, num_heads=12, embed_dim=768, mlp_dim=768 * 4, dropout=0.1):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
-        self.attn = CausalSelfAttention(
-            num_heads=num_heads, embed_dim=embed_dim, dropout=dropout
-        )
-        self.mlp = MLP(embed_dim, dropout=dropout)
+        self.attn = Attention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
+        self.mlp = MLP(embed_dim, mlp_dim, dropout=dropout)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -86,62 +82,94 @@ class GPT(pl.LightningModule):
         self,
         num_heads=12,
         embed_dim=768,
+        mlp_dim=768 * 4,
         dropout=0.1,
         num_blocks=6,
-        sequence_length=1024,
-        vocab_size=25152,
+        image_channels=3,
+        image_size=(256, 256),
+        patch_size=(16, 16),
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        self.sequence_length = sequence_length
-        self.vocab_size = vocab_size
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.spatial_dims = len(image_size)
+        assert len(patch_size) == self.spatial_dims
+        for d in range(self.spatial_dims):
+            assert (
+                image_size[d] % patch_size[d] == 0
+            ), f"image size must be divisible by patch size in all spatial dims, mismatch in dim {d+1}"
+        self.n_patches: tuple[int, ...] = tuple(
+            [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
+        )
 
-        self.token_embeddings = nn.Embedding(
-            vocab_size, embed_dim
-        )  # from word to embedding dim
-        self.pos_embeddings = nn.Embedding(
-            sequence_length, embed_dim
-        )  # from position to embedding dim
+        # embedding
+        self.patch_embed = nn.Conv2d(
+            in_channels=image_channels,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+        self.patch_debed = nn.ConvTranspose2d(
+            in_channels=embed_dim,
+            out_channels=image_channels,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+        self.positional_encoding = nn.Parameter(
+            torch.randn(
+                1, np.prod(self.n_patches), embed_dim
+            )  # extra dim at front for batch
+        )
+
         self.dropout = nn.Dropout(dropout)
 
         self.blocks = nn.Sequential(
-            *[Block(num_heads, embed_dim, dropout) for _ in range(num_blocks)]
+            *[
+                TransformerBlock(num_heads, embed_dim, mlp_dim, dropout)
+                for _ in range(num_blocks)
+            ]
         )  # transformer blocks
 
-        self.ln = nn.LayerNorm(embed_dim)
-        self.output_head = nn.Linear(
-            embed_dim, vocab_size
-        )  # from embedding dim, what word to predict next?
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.ln2 = nn.LayerNorm(embed_dim)
+
+        # output head here ...
 
     def forward(self, x):
-        # x is (batch, sequence_length) with dtype torch.int (indices to vocab words)
-        B, T = x.shape
 
-        # get token embeddings
-        te = self.token_embeddings(x)  # (batch, sequence_length, embed_dim)
-        # get positional embeddings
-        pe = self.pos_embeddings(torch.arange(T, dtype=torch.int))[
-            None, :, :
-        ]  # (1, sequence_length, embed_dim)
+        # B, C, H, W = x.shape
+
+        # embed, and add positional encodings
+        x = self.patch_embed(x)  # (batch, embed_dim, H // patch_size, W // patch_size)
+        x = rearrange(
+            x, "b c nh nw -> b (nh nw) c", nh=self.n_patches[0], nw=self.n_patches[1]
+        )  # (batch, n_patch_h * n_patch_w, embed_dim)
+        x = self.ln1(x)  # (batch, n_patches, embed_dim)
 
         # sum token and positional embeddings
-        x = self.dropout(te + pe)  # (batch, sequence_length, embed_dim)
+        x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
 
         # pass through transformer blocks
         x = self.blocks(x)  # (batch, sequence_length, embed_dim)
-        x = self.ln(x)  # (batch, sequence_length, embed_dim)
+        x = self.ln2(x)  # (batch, sequence_length, embed_dim)
 
-        if self.training:
-            # output logits
-            logits = self.output_head(x)  # (batch, sequence_length, vocab_size)
-        else:
-            logits = self.output_head(x[:, [-1], :])  # (batch, 1, vocab_size)
+        # output head, reverse the patch embedding
+        x = rearrange(
+            x, "b (nh nw) c -> b c nh nw", nh=self.n_patches[0], nw=self.n_patches[1]
+        )
+        x = self.patch_debed(x)  # (batch, image_channels, H, W)
 
-        return logits
+        return x
+
+    def _nparams(self):
+        return sum([p.numel() for p in self.parameters()])
 
 
 if __name__ == "__main__":
-    model = GPT()
-    x = torch.randint(0, 25152, (1, 1024))
+    model = GPT(num_blocks=12, patch_size=(8, 8))
+    print(model._nparams())
+    x = torch.randn(4, 3, 256, 256)
     y = model(x)
-    assert y.shape == (1, 1024, 25152)
+    assert y.shape == x.shape
