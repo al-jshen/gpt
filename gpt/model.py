@@ -77,7 +77,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class GPT(pl.LightningModule):
+class ViT(pl.LightningModule):
     def __init__(
         self,
         num_heads=12,
