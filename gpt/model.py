@@ -168,7 +168,7 @@ class ViT(pl.LightningModule):
 
 
 if __name__ == "__main__":
-    model = GPT(num_blocks=12, patch_size=(8, 8))
+    model = ViT(num_blocks=12, patch_size=(8, 8))
     print(model._nparams())
     x = torch.randn(4, 3, 256, 256)
     y = model(x)
