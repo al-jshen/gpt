@@ -4,7 +4,6 @@ import lightning.pytorch as pl
 import torch.nn as nn
 import torch.nn.functional as F
 from functorch.einops import rearrange
-from deepspeed.ops.adam import FusedAdam
 from einops.layers.torch import Rearrange
 
 
@@ -25,7 +24,7 @@ class Attention(nn.Module):
         self.proj_dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B, T, C = x.shape  # c = embed_dim
+        B, T, C = x.shape  # c = embed_dim, T = sequences (patches)
         H = self.num_heads
 
         # Self-attention
@@ -65,70 +64,13 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-# make a lightning module mlp which is just an mlp but it takes in a 2d input and flattens it
-# then it has a linear layer at the end to output the right number of classes
-class L_MLP(pl.LightningModule):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+class Lambda(nn.Module):
+    def __init__(self, fn):
         super().__init__()
-        self.save_hyperparameters()
-        self.net = nn.Sequential(
-            nn.Flatten(),
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
+        self.fn = fn
 
     def forward(self, x):
-        return self.net(x)
-
-    def configure_optimizers(self):
-        return FusedAdam(self.parameters(), lr=1e-3)
-
-    def _step(self, batch):
-        x, y = batch
-        logits = self(x)
-        loss = F.cross_entropy(logits, y)
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        loss = self._step(batch)
-        self.log(
-            "train_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss = self._step(batch)
-        self.log(
-            "val_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-        return loss
-
-    def testing_step(self, batch, batch_idx):
-        loss = self._step(batch)
-        self.log(
-            "test_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-        return loss
+        return self.fn(x)
 
 
 class TransformerBlock(nn.Module):
@@ -145,7 +87,29 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class ViT(pl.LightningModule):
+class InstanceNormXd(nn.Module):
+    def __init__(self, dim, eps=1e-7):
+        super().__init__()
+        self.eps = eps
+        self.dim = dim
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        # n c h w d
+        n_spatial_dims = len(x.shape) - 2
+        assert n_spatial_dims >= 1
+        std_dims = tuple(range(2, n_spatial_dims + 2))
+        std = torch.std(x, dim=std_dims, keepdim=True)
+        x = (x) / (std + self.eps)
+        x = (
+            x * self.weight[None, :, *(None,) * n_spatial_dims]
+            + self.bias[None, :, *(None,) * n_spatial_dims]
+        )
+        return x
+
+
+class ViT_torch(nn.Module):
     def __init__(
         self,
         num_heads=12,
@@ -156,10 +120,9 @@ class ViT(pl.LightningModule):
         image_channels=3,
         image_size=(256, 256),
         patch_size=(16, 16),
-        output_dim=10,
+        output_head=None,
     ):
         super().__init__()
-        self.save_hyperparameters()
         self.embed_dim = embed_dim
         self.image_size = image_size
         self.patch_size = patch_size
@@ -174,12 +137,24 @@ class ViT(pl.LightningModule):
         )
 
         # embedding
-        self.patch_embed = nn.Conv2d(
-            in_channels=image_channels,
-            out_channels=embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
+        # self.patch_embed = nn.Conv2d(
+        #     in_channels=image_channels,
+        #     out_channels=embed_dim,
+        #     kernel_size=patch_size,
+        #     stride=patch_size,
+        # )
+        self.patch_embed = nn.Sequential(
+            Rearrange(
+                "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
+                p1=patch_size[0],
+                p2=patch_size[1],
+                nh=self.n_patches[0],
+                nw=self.n_patches[1],
+            ),
+            nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
+            nn.Linear(patch_size[0] * patch_size[1] * image_channels, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )  # (batch, im_channels, h, w) -> (batch, n_patches, embed_dim)
 
         self.positional_encoding = nn.Parameter(
             torch.randn(
@@ -196,27 +171,44 @@ class ViT(pl.LightningModule):
             ]
         )  # transformer blocks
 
+        self.in1 = InstanceNormXd(image_channels)
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
 
-        # output head here ...
-        self.patch_debed = nn.ConvTranspose2d(
-            in_channels=embed_dim,
-            out_channels=image_channels,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
-        # self.output_head = nn.Linear(embed_dim, output_dim)
+        # # output head here ...
+        # self.patch_debed = nn.ConvTranspose2d(
+        #     in_channels=embed_dim,
+        #     out_channels=image_channels,
+        #     kernel_size=patch_size,
+        #     stride=patch_size,
+        # )
+
+        if output_head is None:
+            self.output_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, patch_size[0] * patch_size[1] * image_channels),
+                nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
+                Rearrange(
+                    "b (nh nw) (p1 p2 c) -> b c (nh p1) (nw p2)",
+                    p1=patch_size[0],
+                    p2=patch_size[1],
+                    nh=self.n_patches[0],
+                    nw=self.n_patches[1],
+                ),
+            )  # (batch, n_patches, embed_dim) -> (batch, im_channels, h, w)
+            # self.output_head = nn.Linear(embed_dim, output_dim)
+        else:
+            self.output_head = output_head
 
     def forward(self, x):
-
         # B, C, H, W = x.shape
+
+        # normalize
+        x = self.in1(x)
 
         # embed, and add positional encodings
         x = self.patch_embed(x)  # (batch, embed_dim, H // patch_size, W // patch_size)
-        x = rearrange(
-            x, "b c nh nw -> b (nh nw) c", nh=self.n_patches[0], nw=self.n_patches[1]
-        )  # (batch, n_patch_h * n_patch_w, embed_dim)
+
         # normalize
         x = self.ln1(x)
 
@@ -225,69 +217,87 @@ class ViT(pl.LightningModule):
 
         # pass through transformer blocks
         x = self.blocks(x)  # (batch, sequence_length, embed_dim)
+
         # normalize again
         x = self.ln2(x)  # (batch, sequence_length, embed_dim)
 
         # output head, reverse the patch embedding
-        x = rearrange(
-            x, "b (nh nw) c -> b c nh nw", nh=self.n_patches[0], nw=self.n_patches[1]
-        )
-        x = self.patch_debed(x)  # (batch, image_channels, H, W)
+        # x = self.patch_debed(x)  # (batch, image_channels, H, W)
 
-        # x = x[:, 0, :]  # pull out the class token  (batch, embed_dim)
-        # # send to output dimensions
-        # x = self.output_head(x)  # (batch, output_dim)
+        x = self.output_head(x)
 
         return x
-
-    def configure_optimizers(self):
-        return FusedAdam(self.parameters(), lr=1e-2)
-
-    def _step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = F.mse_loss(y_hat, y)
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self.log(
-            "train_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self.log(
-            "val_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-        return loss
-
-    def testing_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self.log(
-            "test_loss",
-            loss,
-            on_step=True,
-            on_epoch=True,
-            prog_bar=True,
-            sync_dist=True,
-            batch_size=batch[0].shape[0],
-        )
-        return loss
 
     @property
     def nparams(self):
         return sum([p.numel() for p in self.parameters()])
+
+
+class ViT(pl.LightningModule):
+    def __init__(
+        self,
+        num_heads=12,
+        embed_dim=768,
+        mlp_dim=768 * 4,
+        dropout=0.1,
+        num_blocks=6,
+        image_channels=3,
+        image_size=(256, 256),
+        patch_size=(16, 16),
+        output_head=None,
+        lr=1e-3,
+        loss_fn=F.mse_loss,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = ViT_torch(
+            num_heads=num_heads,
+            embed_dim=embed_dim,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+            num_blocks=num_blocks,
+            image_channels=image_channels,
+            image_size=image_size,
+            patch_size=patch_size,
+            output_head=output_head,
+        )
+
+        self.loss_fn = loss_fn
+        self.lr = lr
+
+    def forward(self, x):
+        x = self.model(x)
+        return x
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.loss_fn(y_hat, y)
+        self.log(
+            "train_loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.loss_fn(y_hat, y)
+        self.log(
+            "val_loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)

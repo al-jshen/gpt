@@ -10,13 +10,16 @@ class CIFAR10DataModule(pl.LightningDataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
+        collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
+        extra_transforms=[],
     ):
         super().__init__()
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.root_dir = root_dir
+        self.collate_fn = collate_fn
         self.transform = transforms.Compose(
             [
                 transforms.ToTensor(),
@@ -24,6 +27,7 @@ class CIFAR10DataModule(pl.LightningDataModule):
                     mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
                     std=[x / 255.0 for x in [63.0, 62.1, 66.7]],
                 ),
+                *extra_transforms,
             ]
         )
 
@@ -50,6 +54,7 @@ class CIFAR10DataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
     def val_dataloader(self):
@@ -59,6 +64,7 @@ class CIFAR10DataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
     def test_dataloader(self):
@@ -68,6 +74,7 @@ class CIFAR10DataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
+            collate_fn=self.collate_fn,
         )
 
 
@@ -77,8 +84,9 @@ class MNISTDataModule(pl.LightningDataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        root_dir="/scratch/gpfs/js5013/data/ml/",
         collate_fn=None,
+        root_dir="/scratch/gpfs/js5013/data/ml/",
+        extra_transforms=[],
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -90,6 +98,7 @@ class MNISTDataModule(pl.LightningDataModule):
             [
                 transforms.ToTensor(),
                 transforms.Normalize((0.1307,), (0.3081,)),
+                *extra_transforms,
             ]
         )
 
@@ -138,3 +147,12 @@ class MNISTDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             collate_fn=self.collate_fn,
         )
+
+
+class AddGaussianNoise:
+    def __init__(self, amount=0.1):
+        self.amount = amount
+
+    def __call__(self, tensor):
+        std = torch.std(tensor)
+        return tensor + torch.randn(tensor.size()) * (std * self.amount)
