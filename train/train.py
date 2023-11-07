@@ -62,7 +62,7 @@ else:
 
 if args.dataset == "cifar10":
     image_size = (32, 32)
-    patch_size = (2, 2)
+    patch_size = (4, 4)
     image_channels = 3
     output_dim = 10
     datamodule = CIFAR10DataModule(
@@ -95,14 +95,14 @@ if args.model == "vit":
         image_size=image_size,
         patch_size=patch_size,
         image_channels=image_channels,
-        embed_dim=768,
-        mlp_dim=768 * 4,
-        num_heads=12,
-        num_blocks=4,
+        embed_dim=512,
+        mlp_dim=512 * 4,
+        num_heads=16,
+        num_blocks=6,
         dropout=0.1,
         class_token=args.task == "classification",
-        lr=5e-3,
-        output_head=nn.Linear(768, output_dim)
+        lr=1e-3,
+        output_head=nn.Linear(512, output_dim)
         if args.task == "classification"
         else None,
         loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,

@@ -137,15 +137,29 @@ class ViT(nn.Module):
             [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
         )
 
-        # embedding
+        # # embedding
+        # self.patch_embed = nn.Sequential(
+        #     nn.Conv2d(
+        #         in_channels=image_channels,
+        #         out_channels=embed_dim,
+        #         kernel_size=patch_size,
+        #         stride=patch_size,
+        #     ),
+        #     Rearrange("b c h w -> b (h w) c"),
+        # )
+
+        # this seems to have less patch artifacts vs conv
         self.patch_embed = nn.Sequential(
-            nn.Conv2d(
-                in_channels=image_channels,
-                out_channels=embed_dim,
-                kernel_size=patch_size,
-                stride=patch_size,
+            Rearrange(
+                "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
+                p1=patch_size[0],
+                p2=patch_size[1],
+                nh=self.n_patches[0],
+                nw=self.n_patches[1],
             ),
-            Rearrange("b c h w -> b (h w) c"),
+            nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
+            nn.Linear(patch_size[0] * patch_size[1] * image_channels, embed_dim),
+            nn.LayerNorm(embed_dim),
         )
 
         self.positional_encoding = nn.Parameter(
@@ -168,24 +182,35 @@ class ViT(nn.Module):
             ]
         )  # transformer blocks
 
-        self.in1 = InstanceNormXd(image_channels)
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
 
         # # output head here ...
-
         if output_head is None:
+            # self.output_head = nn.Sequential(
+            #     Rearrange(
+            #         "b (nh nw) c -> b c nh nw",
+            #         nh=self.n_patches[0],
+            #         nw=self.n_patches[1],
+            #     ),
+            #     nn.ConvTranspose2d(
+            #         in_channels=embed_dim,
+            #         out_channels=image_channels,
+            #         kernel_size=patch_size,
+            #         stride=patch_size,
+            #     ),
+            # )
+
             self.output_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, patch_size[0] * patch_size[1] * image_channels),
+                nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
                 Rearrange(
-                    "b (nh nw) c -> b c nh nw",
+                    "b (nh nw) (p1 p2 c) -> b c (nh p1) (nw p2)",
+                    p1=patch_size[0],
+                    p2=patch_size[1],
                     nh=self.n_patches[0],
                     nw=self.n_patches[1],
-                ),
-                nn.ConvTranspose2d(
-                    in_channels=embed_dim,
-                    out_channels=image_channels,
-                    kernel_size=patch_size,
-                    stride=patch_size,
                 ),
             )
         else:
@@ -193,9 +218,6 @@ class ViT(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-
-        # normalize
-        x = self.in1(x)
 
         # embed
         x = self.patch_embed(x)
@@ -303,4 +325,7 @@ class LightningWrapper(pl.LightningModule):
         )
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        return torch.optim.Adam(
+            self.parameters(),
+            lr=self.lr,  # momentum=0.9, nesterov=True
+        )
