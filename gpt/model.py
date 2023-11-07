@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functorch.einops import rearrange
 from einops.layers.torch import Rearrange
+from einops import repeat
 
 
 class Attention(nn.Module):
@@ -19,7 +20,7 @@ class Attention(nn.Module):
         self.embed_dim = embed_dim
         self.dropout = dropout
 
-        self.attn = nn.Linear(embed_dim, embed_dim * 3)
+        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
@@ -28,10 +29,9 @@ class Attention(nn.Module):
         H = self.num_heads
 
         # Self-attention
-        qkv = self.attn(x)  # b t c -> b t 3c
-        q, k, v = qkv.view(3, C, B, T)  # q, k, v are each (c b t)
+        qkv = self.to_qkv(x).chunk(3, dim=-1)  # b t c -> b t 3c -> 3 b t c
         q, k, v = map(
-            lambda t: rearrange(t, "(d h) b t -> b h t d", h=H), (q, k, v)
+            lambda t: rearrange(t, "b t (h d) -> b h t d", h=H), qkv
         )  # where channels C = dims D * heads H
 
         # Scale dot product attention, attend over T dim (2nd last)
@@ -96,7 +96,7 @@ class InstanceNormXd(nn.Module):
         self.bias = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x):
-        # n c h w d
+        # n c n1, ..., nd
         n_spatial_dims = len(x.shape) - 2
         assert n_spatial_dims >= 1
         std_dims = tuple(range(2, n_spatial_dims + 2))
@@ -109,7 +109,7 @@ class InstanceNormXd(nn.Module):
         return x
 
 
-class ViT_torch(nn.Module):
+class ViT(nn.Module):
     def __init__(
         self,
         num_heads=12,
@@ -121,6 +121,7 @@ class ViT_torch(nn.Module):
         image_size=(256, 256),
         patch_size=(16, 16),
         output_head=None,
+        class_token=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -137,30 +138,26 @@ class ViT_torch(nn.Module):
         )
 
         # embedding
-        # self.patch_embed = nn.Conv2d(
-        #     in_channels=image_channels,
-        #     out_channels=embed_dim,
-        #     kernel_size=patch_size,
-        #     stride=patch_size,
-        # )
         self.patch_embed = nn.Sequential(
-            Rearrange(
-                "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
-                p1=patch_size[0],
-                p2=patch_size[1],
-                nh=self.n_patches[0],
-                nw=self.n_patches[1],
+            nn.Conv2d(
+                in_channels=image_channels,
+                out_channels=embed_dim,
+                kernel_size=patch_size,
+                stride=patch_size,
             ),
-            nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
-            nn.Linear(patch_size[0] * patch_size[1] * image_channels, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )  # (batch, im_channels, h, w) -> (batch, n_patches, embed_dim)
+            Rearrange("b c h w -> b (h w) c"),
+        )
 
         self.positional_encoding = nn.Parameter(
             torch.randn(
-                1, np.prod(self.n_patches), embed_dim
+                1, np.prod(self.n_patches) + (1 if class_token else 0), embed_dim
             )  # extra dim at front for batch, extra dim in middle for class token
         )
+
+        if class_token:
+            self.class_token = nn.Parameter(torch.randn(1, 1, embed_dim))
+        else:
+            self.class_token = None
 
         self.dropout = nn.Dropout(dropout)
 
@@ -176,41 +173,40 @@ class ViT_torch(nn.Module):
         self.ln2 = nn.LayerNorm(embed_dim)
 
         # # output head here ...
-        # self.patch_debed = nn.ConvTranspose2d(
-        #     in_channels=embed_dim,
-        #     out_channels=image_channels,
-        #     kernel_size=patch_size,
-        #     stride=patch_size,
-        # )
 
         if output_head is None:
             self.output_head = nn.Sequential(
-                nn.LayerNorm(embed_dim),
-                nn.Linear(embed_dim, patch_size[0] * patch_size[1] * image_channels),
-                nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
                 Rearrange(
-                    "b (nh nw) (p1 p2 c) -> b c (nh p1) (nw p2)",
-                    p1=patch_size[0],
-                    p2=patch_size[1],
+                    "b (nh nw) c -> b c nh nw",
                     nh=self.n_patches[0],
                     nw=self.n_patches[1],
                 ),
-            )  # (batch, n_patches, embed_dim) -> (batch, im_channels, h, w)
-            # self.output_head = nn.Linear(embed_dim, output_dim)
+                nn.ConvTranspose2d(
+                    in_channels=embed_dim,
+                    out_channels=image_channels,
+                    kernel_size=patch_size,
+                    stride=patch_size,
+                ),
+            )
         else:
             self.output_head = output_head
 
     def forward(self, x):
-        # B, C, H, W = x.shape
+        B, C, H, W = x.shape
 
         # normalize
         x = self.in1(x)
 
-        # embed, and add positional encodings
-        x = self.patch_embed(x)  # (batch, embed_dim, H // patch_size, W // patch_size)
+        # embed
+        x = self.patch_embed(x)
 
         # normalize
         x = self.ln1(x)
+
+        # add class token if necessary
+        if self.class_token is not None:
+            class_token = repeat(self.class_token, "1 1 d -> b 1 d", b=B)
+            x = torch.cat((x, class_token), dim=1)
 
         # add positional encoding and do dropout
         x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
@@ -221,8 +217,9 @@ class ViT_torch(nn.Module):
         # normalize again
         x = self.ln2(x)  # (batch, sequence_length, embed_dim)
 
-        # output head, reverse the patch embedding
-        # x = self.patch_debed(x)  # (batch, image_channels, H, W)
+        # extract class token if necessary
+        if self.class_token is not None:
+            x = x[:, -1, :]
 
         x = self.output_head(x)
 
@@ -232,43 +229,35 @@ class ViT_torch(nn.Module):
     def nparams(self):
         return sum([p.numel() for p in self.parameters()])
 
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad = False
 
-class ViT(pl.LightningModule):
-    def __init__(
-        self,
-        num_heads=12,
-        embed_dim=768,
-        mlp_dim=768 * 4,
-        dropout=0.1,
-        num_blocks=6,
-        image_channels=3,
-        image_size=(256, 256),
-        patch_size=(16, 16),
-        output_head=None,
-        lr=1e-3,
-        loss_fn=F.mse_loss,
-    ):
+    def unfreeze(self):
+        for p in self.parameters():
+            p.requires_grad = True
+
+
+class LightningWrapper(pl.LightningModule):
+    """
+    Turns a torch.nn.Module into a pl.LightningModule
+    """
+
+    def __init__(self, modelclass, **kwargs):
         super().__init__()
         self.save_hyperparameters()
-
-        self.model = ViT_torch(
-            num_heads=num_heads,
-            embed_dim=embed_dim,
-            mlp_dim=mlp_dim,
-            dropout=dropout,
-            num_blocks=num_blocks,
-            image_channels=image_channels,
-            image_size=image_size,
-            patch_size=patch_size,
-            output_head=output_head,
-        )
-
-        self.loss_fn = loss_fn
-        self.lr = lr
+        assert "lr" in kwargs, "must have lr"
+        assert "loss_fn" in kwargs, "must have loss_fn"
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        # remove lr and loss_fn from kwargs
+        del kwargs["lr"]
+        del kwargs["loss_fn"]
+        # build model
+        self.model = modelclass(**kwargs)
 
     def forward(self, x):
-        x = self.model(x)
-        return x
+        return self.model(x)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
@@ -291,6 +280,20 @@ class ViT(pl.LightningModule):
         loss = self.loss_fn(y_hat, y)
         self.log(
             "val_loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+    def testing_step(self, batch, batch_idx):
+        x, y = batch
+        y_hat = self(x)
+        loss = self.loss_fn(y_hat, y)
+        self.log(
+            "test_loss",
             loss,
             prog_bar=True,
             logger=True,
