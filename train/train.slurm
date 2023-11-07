@@ -1,8 +1,10 @@
 #!/bin/bash
 
-#SBATCH --nodes=1             
-#SBATCH --gpus-per-node=2
-#SBATCH --ntasks-per-node=2   
+#SBATCH --nodes=1
+#SBATCH --partition=gpu
+#SBATCH --constraint=h100
+#SBATCH --gpus-per-node=1
+#SBATCH --ntasks-per-node=1   
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=20G
 #SBATCH --time=00:30:00
@@ -12,4 +14,4 @@
 # export PYTHONFAULTHANDLER=1
 
 # run script from above
-srun python3 train.py --dataset mnist --task reconstruction --gpus 2 --epochs 30 --batch_size 256 --precision bf16-mixed --strategy ddp --num_blocks 6 # --augment noise --noise 0.2 --load_ckpt ./lightning_logs/version_1009299/checkpoints/epoch=29-step=3540.ckpt
+srun python3 train.py --dataset mnist --task reconstruction --model vit --gpus 1 --epochs 10 --batch_size 512 --precision bf16-mixed --strategy ddp --data_dir /mnt/home/jshen/ceph/data/ml/ # --augment noise --noise 0.2 

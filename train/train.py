@@ -2,7 +2,7 @@ import argparse
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("--dataset", type=str, choices=["cifar10", "mnist"], required=True)
-parser.add_argument("--model", type=str, choices=["vit"], default="vit")
+parser.add_argument("--model", type=str, choices=["vit", "alt_vit"], default="vit")
 parser.add_argument("--batch_size", type=int, default=256)
 parser.add_argument(
     "--precision",
@@ -21,9 +21,9 @@ parser.add_argument(
 )
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--noise", type=float, default=0.1)
-parser.add_argument("--num_blocks", type=int, default=2)
 parser.add_argument("--gpus", type=int, default=1)
 parser.add_argument("--load_ckpt", type=str, default=None)
+parser.add_argument("--data_dir", type=str)
 args = parser.parse_args()
 
 
@@ -32,7 +32,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-from gpt.model import ViT, Lambda
+from gpt.model import ViT, LightningWrapper
+from gpt.alt_model import ViT as AltViT
 from gpt.data import CIFAR10DataModule, MNISTDataModule, AddGaussianNoise
 
 torch.set_float32_matmul_precision("medium")
@@ -61,7 +62,7 @@ else:
 
 if args.dataset == "cifar10":
     image_size = (32, 32)
-    patch_size = (4, 4)
+    patch_size = (2, 2)
     image_channels = 3
     output_dim = 10
     datamodule = CIFAR10DataModule(
@@ -69,6 +70,8 @@ if args.dataset == "cifar10":
         collate_fn=collate,
         num_workers=min(os.cpu_count(), 4),
         extra_transforms=extra_transforms,
+        root_dir=args.data_dir,
+        pin_memory=True,
     )
 elif args.dataset == "mnist":
     image_size = (28, 28)
@@ -80,35 +83,48 @@ elif args.dataset == "mnist":
         collate_fn=collate,
         num_workers=min(os.cpu_count(), 4),
         extra_transforms=extra_transforms,
+        root_dir=args.data_dir,
+        pin_memory=True,
     )
 else:
     raise ValueError("Invalid dataset")
 
 if args.model == "vit":
-    if args.load_ckpt is not None:
-        model = ViT.load_from_checkpoint(args.load_ckpt)
-    else:
-        model = ViT(
-            image_size=image_size,
-            patch_size=patch_size,
-            image_channels=image_channels,
-            num_blocks=args.num_blocks,
-            dropout=0.0,
-        )
+    model = LightningWrapper(
+        ViT,
+        image_size=image_size,
+        patch_size=patch_size,
+        image_channels=image_channels,
+        embed_dim=768,
+        mlp_dim=768 * 4,
+        num_heads=12,
+        num_blocks=4,
+        dropout=0.1,
+        class_token=args.task == "classification",
+        lr=5e-3,
+        output_head=nn.Linear(768, output_dim)
+        if args.task == "classification"
+        else None,
+        loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,
+    )
 
-        if args.task == "classification":
-            output_head = nn.Sequential(
-                nn.Linear(model.embed_dim, output_dim), Lambda(lambda x: x.mean(dim=1))
-            )
-            loss_fn = F.cross_entropy
-        elif args.task == "reconstruction":
-            output_head = None
-            loss_fn = F.mse_loss
-        else:
-            raise ValueError("Invalid task")
-
-        model.output_head = output_head
-        model.loss_fn = loss_fn
+elif args.model == "alt_vit":
+    assert args.task == "classification"
+    model = LightningWrapper(
+        AltViT,
+        image_size=image_size,
+        patch_size=4,
+        num_classes=output_dim,
+        dim=1024,
+        depth=6,
+        heads=16,
+        mlp_dim=2048,
+        dropout=0.1,
+        emb_dropout=0.1,
+        channels=image_channels,
+        lr=1e-3,
+        loss_fn=F.cross_entropy,
+    )
 
 else:
     raise ValueError("Invalid model type")
