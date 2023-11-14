@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from einops import rearrange, repeat
+from einops import rearrange
 from einops.layers.torch import Rearrange
 
 # helpers
@@ -102,7 +102,6 @@ class ViT(nn.Module):
         depth,
         heads,
         mlp_dim,
-        pool="cls",
         channels=3,
         dim_head=64,
         dropout=0.0,
@@ -118,10 +117,6 @@ class ViT(nn.Module):
 
         num_patches = (image_height // patch_height) * (image_width // patch_width)
         patch_dim = channels * patch_height * patch_width
-        assert pool in {
-            "cls",
-            "mean",
-        }, "pool type must be either cls (cls token) or mean (mean pooling)"
 
         self.to_patch_embedding = nn.Sequential(
             Rearrange(
@@ -134,13 +129,11 @@ class ViT(nn.Module):
             nn.LayerNorm(dim),
         )
 
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, dim))
         self.dropout = nn.Dropout(emb_dropout)
 
         self.transformer = Transformer(dim, depth, heads, dim_head, mlp_dim, dropout)
 
-        self.pool = pool
         self.to_latent = nn.Identity()
 
         self.mlp_head = nn.Linear(dim, num_classes)
@@ -149,14 +142,12 @@ class ViT(nn.Module):
         x = self.to_patch_embedding(img)
         b, n, _ = x.shape
 
-        cls_tokens = repeat(self.cls_token, "1 1 d -> b 1 d", b=b)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x += self.pos_embedding[:, : (n + 1)]
+        x += self.pos_embedding[:, :n]
         x = self.dropout(x)
 
         x = self.transformer(x)
 
-        x = x.mean(dim=1) if self.pool == "mean" else x[:, 0]
+        x = x.mean(dim=1)
 
         x = self.to_latent(x)
         return self.mlp_head(x)
