@@ -73,17 +73,40 @@ class Lambda(nn.Module):
         return self.fn(x)
 
 
+class Parallel(nn.Module):
+    def __init__(self, fns):
+        super().__init__()
+        self.fns = nn.ModuleList(fns)
+
+    def forward(self, x):
+        return sum([fn(x) for fn in self.fns])
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, num_heads=12, embed_dim=768, mlp_dim=768 * 4, dropout=0.1):
+    def __init__(
+        self,
+        num_heads=12,
+        embed_dim=768,
+        mlp_dim=768 * 4,
+        dropout=0.1,
+        parallel_paths=2,
+    ):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
-        self.attn = Attention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
-        self.mlp = MLP(embed_dim, mlp_dim, dropout=dropout)
+        self.attns = Parallel(
+            [
+                Attention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
+                for _ in range(parallel_paths)
+            ]
+        )
+        self.mlps = Parallel(
+            [MLP(embed_dim, mlp_dim, dropout=dropout) for _ in range(parallel_paths)]
+        )
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.attns(self.ln1(x))
+        x = x + self.mlps(self.ln2(x))
         return x
 
 
@@ -148,6 +171,7 @@ class ViT(nn.Module):
         #     Rearrange("b c h w -> b (h w) c"),
         # )
 
+        patch_dim = patch_size[0] * patch_size[1] * image_channels
         # this seems to have less patch artifacts vs conv
         self.patch_embed = nn.Sequential(
             Rearrange(
@@ -157,8 +181,8 @@ class ViT(nn.Module):
                 nh=self.n_patches[0],
                 nw=self.n_patches[1],
             ),
-            nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
-            nn.Linear(patch_size[0] * patch_size[1] * image_channels, embed_dim),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, embed_dim),
             nn.LayerNorm(embed_dim),
         )
 
@@ -182,8 +206,7 @@ class ViT(nn.Module):
             ]
         )  # transformer blocks
 
-        self.ln1 = nn.LayerNorm(embed_dim)
-        self.ln2 = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
 
         # # output head here ...
         if output_head is None:
@@ -222,9 +245,6 @@ class ViT(nn.Module):
         # embed
         x = self.patch_embed(x)
 
-        # normalize
-        x = self.ln1(x)
-
         # add class token if necessary
         if self.class_token is not None:
             class_token = repeat(self.class_token, "1 1 d -> b 1 d", b=B)
@@ -236,12 +256,14 @@ class ViT(nn.Module):
         # pass through transformer blocks
         x = self.blocks(x)  # (batch, sequence_length, embed_dim)
 
-        # normalize again
-        x = self.ln2(x)  # (batch, sequence_length, embed_dim)
+        # normalize
+        x = self.norm(x)  # (batch, sequence_length, embed_dim)
 
         # extract class token if necessary
         if self.class_token is not None:
             x = x[:, -1, :]
+        else:
+            x = x.mean(dim=1)
 
         x = self.output_head(x)
 

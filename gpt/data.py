@@ -105,6 +105,10 @@ class CIFAR10DataModule(DataModule):
             "truck",
         ]
 
+    @property
+    def num_classes(self):
+        return len(self.classes)
+
     def prepare_data(self):
         torchvision.datasets.CIFAR10(root=self.root_dir, train=True, download=True)
         torchvision.datasets.CIFAR10(root=self.root_dir, train=False, download=True)
@@ -120,6 +124,7 @@ class CIFAR10DataModule(DataModule):
                 download=False,
                 transform=self.transform,
             )
+
 
 
 class MNISTDataModule(DataModule):
