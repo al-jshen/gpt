@@ -101,7 +101,7 @@ if args.model == "vit":
         num_blocks=6,
         dropout=0.1,
         class_token=args.task == "classification",
-        lr=1e-3,
+        lr=2e-3,
         output_head=nn.Linear(512, output_dim)
         if args.task == "classification"
         else None,
