@@ -1,38 +1,21 @@
 import argparse
+import toml
+import munch
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-parser.add_argument("--dataset", type=str, choices=["cifar10", "mnist"], required=True)
-parser.add_argument("--model", type=str, choices=["vit", "alt_vit"], default="vit")
-parser.add_argument("--batch_size", type=int, default=256)
-parser.add_argument(
-    "--precision",
-    type=str,
-    choices=["16-mixed", "bf16-mixed", "32-true"],
-    default="32-true",
-)
-parser.add_argument(
-    "--task", choices=["classification", "reconstruction"], default="classification"
-)
-parser.add_argument("--augment", choices=["none", "noise", "mask"], default="none")
-parser.add_argument(
-    "--strategy",
-    choices=["ddp", "fsdp", "ddp_find_unused_parameters_true", "deepspeed_stage_3"],
-    default="ddp",
-)
-parser.add_argument("--epochs", type=int, default=10)
-parser.add_argument("--noise", type=float, default=0.1)
-parser.add_argument("--gpus", type=int, default=1)
-parser.add_argument("--load_ckpt", type=str, default=None)
-parser.add_argument("--data_dir", type=str)
+parser.add_argument("--config", type=str, default="config.toml")
 args = parser.parse_args()
 
+cfg = munch.munchify(toml.load(args.config))
+del args
+args = cfg.config
 
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-from gpt.model import ViT, LightningWrapper
+from gpt.model import ViT, LightningWrapper, ClassificationHead
 from gpt.alt_model import ViT as AltViT
 from gpt.data import CIFAR10DataModule, MNISTDataModule, AddGaussianNoise
 
@@ -95,14 +78,14 @@ if args.model == "vit":
         image_size=image_size,
         patch_size=patch_size,
         image_channels=image_channels,
-        embed_dim=512,
-        mlp_dim=512 * 4,
-        num_heads=16,
-        num_blocks=6,
+        embed_dim=256,
+        mlp_dim=256,
+        num_heads=8,
+        num_blocks=2,
         dropout=0.1,
-        class_token=args.task == "classification",
+        class_token=False,  # args.task == "classification",
         lr=2e-3,
-        output_head=nn.Linear(512, output_dim)
+        output_head=ClassificationHead(256, output_dim, "mean")
         if args.task == "classification"
         else None,
         loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,
@@ -140,4 +123,6 @@ trainer = pl.Trainer(
     enable_progress_bar=True,
     profiler="simple",
 )
-trainer.fit(model, datamodule, ckpt_path=args.load_ckpt)
+trainer.fit(
+    model, datamodule, ckpt_path=args.load_ckpt if args.load_ckpt != "" else None
+)

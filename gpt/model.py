@@ -73,6 +73,24 @@ class Lambda(nn.Module):
         return self.fn(x)
 
 
+class ClassificationHead(nn.Module):
+    def __init__(self, in_dims, num_classes, pool="cls"):
+        assert pool in {
+            "cls",
+            "mean",
+        }, f"pool must be one of 'cls' or 'mean', got {pool}"
+        super().__init__()
+        self.pool = pool
+        self.proj = nn.Linear(in_dims, num_classes)
+
+    def forward(self, x):
+        if self.pool == "cls":
+            x = x[:, -1]
+        elif self.pool == "mean":
+            x = x.mean(dim=1)
+        return self.proj(x)
+
+
 class Parallel(nn.Module):
     def __init__(self, fns):
         super().__init__()
@@ -94,6 +112,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
+        # self.ln = nn.LayerNorm(embed_dim)
         self.attns = Parallel(
             [
                 Attention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
@@ -108,6 +127,9 @@ class TransformerBlock(nn.Module):
         x = x + self.attns(self.ln1(x))
         x = x + self.mlps(self.ln2(x))
         return x
+        # x = x + self.attns(x)
+        # x = x + self.mlps(x)
+        # return self.ln(x)
 
 
 class InstanceNormXd(nn.Module):
@@ -259,11 +281,11 @@ class ViT(nn.Module):
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
 
-        # extract class token if necessary
-        if self.class_token is not None:
-            x = x[:, -1, :]
-        else:
-            x = x.mean(dim=1)
+        # # extract class token if necessary
+        # if self.class_token is not None:
+        #     x = x[:, -1, :]
+        # else:
+        #     x = x.mean(dim=1)
 
         x = self.output_head(x)
 
