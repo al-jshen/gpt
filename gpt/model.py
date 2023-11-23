@@ -183,30 +183,30 @@ class ViT(nn.Module):
         )
 
         # # embedding
-        # self.patch_embed = nn.Sequential(
-        #     nn.Conv2d(
-        #         in_channels=image_channels,
-        #         out_channels=embed_dim,
-        #         kernel_size=patch_size,
-        #         stride=patch_size,
-        #     ),
-        #     Rearrange("b c h w -> b (h w) c"),
-        # )
-
-        patch_dim = patch_size[0] * patch_size[1] * image_channels
-        # this seems to have less patch artifacts vs conv
         self.patch_embed = nn.Sequential(
-            Rearrange(
-                "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
-                p1=patch_size[0],
-                p2=patch_size[1],
-                nh=self.n_patches[0],
-                nw=self.n_patches[1],
+            nn.Conv2d(
+                in_channels=image_channels,
+                out_channels=embed_dim,
+                kernel_size=patch_size,
+                stride=patch_size,
             ),
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
+            Rearrange("b c h w -> b (h w) c"),
         )
+
+        # this seems to have less patch artifacts vs conv
+        # patch_dim = patch_size[0] * patch_size[1] * image_channels
+        # self.patch_embed = nn.Sequential(
+        #     Rearrange(
+        #         "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
+        #         p1=patch_size[0],
+        #         p2=patch_size[1],
+        #         nh=self.n_patches[0],
+        #         nw=self.n_patches[1],
+        #     ),
+        #     nn.LayerNorm(patch_dim),
+        #     nn.Linear(patch_dim, embed_dim),
+        #     nn.LayerNorm(embed_dim),
+        # )
 
         self.positional_encoding = nn.Parameter(
             torch.randn(
@@ -232,32 +232,32 @@ class ViT(nn.Module):
 
         # # output head here ...
         if output_head is None:
-            # self.output_head = nn.Sequential(
-            #     Rearrange(
-            #         "b (nh nw) c -> b c nh nw",
-            #         nh=self.n_patches[0],
-            #         nw=self.n_patches[1],
-            #     ),
-            #     nn.ConvTranspose2d(
-            #         in_channels=embed_dim,
-            #         out_channels=image_channels,
-            #         kernel_size=patch_size,
-            #         stride=patch_size,
-            #     ),
-            # )
-
             self.output_head = nn.Sequential(
-                nn.LayerNorm(embed_dim),
-                nn.Linear(embed_dim, patch_size[0] * patch_size[1] * image_channels),
-                nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
                 Rearrange(
-                    "b (nh nw) (p1 p2 c) -> b c (nh p1) (nw p2)",
-                    p1=patch_size[0],
-                    p2=patch_size[1],
+                    "b (nh nw) c -> b c nh nw",
                     nh=self.n_patches[0],
                     nw=self.n_patches[1],
                 ),
+                nn.ConvTranspose2d(
+                    in_channels=embed_dim,
+                    out_channels=image_channels,
+                    kernel_size=patch_size,
+                    stride=patch_size,
+                ),
             )
+
+            # self.output_head = nn.Sequential(
+            #     nn.LayerNorm(embed_dim),
+            #     nn.Linear(embed_dim, patch_size[0] * patch_size[1] * image_channels),
+            #     nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
+            #     Rearrange(
+            #         "b (nh nw) (p1 p2 c) -> b c (nh p1) (nw p2)",
+            #         p1=patch_size[0],
+            #         p2=patch_size[1],
+            #         nh=self.n_patches[0],
+            #         nw=self.n_patches[1],
+            #     ),
+            # )
         else:
             self.output_head = output_head
 

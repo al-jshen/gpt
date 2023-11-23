@@ -28,7 +28,17 @@ elif args.task == "reconstruction":
     def collate(lop):
         x, _ = zip(*lop)
         x = torch.stack(x)
-        return x, x
+        return (
+            x
+            + (
+                torch.randn(x.shape)
+                * torch.std(x, axis=(0, 2, 3), keepdim=True)
+                * args.noise
+                if args.augment == "noise"
+                else 0
+            ),
+            x,
+        )
 
 else:
     raise ValueError("Invalid task")
@@ -36,7 +46,7 @@ else:
 if args.augment == "none":
     extra_transforms = []
 elif args.augment == "noise":
-    extra_transforms = [AddGaussianNoise(args.noise)]
+    extra_transforms = []
 elif args.augment == "mask":
     raise NotImplementedError("Masking not implemented")
 else:
@@ -78,14 +88,14 @@ if args.model == "vit":
         image_size=image_size,
         patch_size=patch_size,
         image_channels=image_channels,
-        embed_dim=256,
-        mlp_dim=256,
+        embed_dim=512,
+        mlp_dim=1024,
         num_heads=8,
         num_blocks=2,
         dropout=0.1,
         class_token=False,  # args.task == "classification",
         lr=2e-3,
-        output_head=ClassificationHead(256, output_dim, "mean")
+        output_head=ClassificationHead(512, output_dim, "mean")
         if args.task == "classification"
         else None,
         loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,

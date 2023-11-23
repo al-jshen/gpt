@@ -71,6 +71,7 @@ class CIFAR10DataModule(DataModule):
         collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
+        extra_target_transforms=[],
     ):
         super().__init__(
             batch_size=batch_size,
@@ -116,7 +117,10 @@ class CIFAR10DataModule(DataModule):
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
             self.trainset = torchvision.datasets.CIFAR10(
-                root=self.root_dir, train=True, download=False, transform=self.transform
+                root=self.root_dir,
+                train=True,
+                download=False,
+                transform=self.transform,
             )
             self.testset = torchvision.datasets.CIFAR10(
                 root=self.root_dir,
@@ -124,7 +128,6 @@ class CIFAR10DataModule(DataModule):
                 download=False,
                 transform=self.transform,
             )
-
 
 
 class MNISTDataModule(DataModule):
@@ -159,7 +162,10 @@ class MNISTDataModule(DataModule):
     def setup(self, stage=None):
         if stage == "fit" or stage is None:
             self.trainset = torchvision.datasets.MNIST(
-                root=self.root_dir, train=True, download=False, transform=self.transform
+                root=self.root_dir,
+                train=True,
+                download=False,
+                transform=self.transform,
             )
             self.testset = torchvision.datasets.MNIST(
                 root=self.root_dir,
