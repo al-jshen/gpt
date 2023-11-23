@@ -91,6 +91,34 @@ class ClassificationHead(nn.Module):
         return self.proj(x)
 
 
+class DebedHead(nn.Module):
+    def __init__(self, in_channels, out_channels, image_size, patch_size):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.image_size = image_size
+        self.patch_size = patch_size
+        assert len(image_size) == len(patch_size)
+        self.spatial_dims = len(image_size)
+        assert self.spatial_dims <= 3, "spatial dims must be 1, 2, or 3"
+        self.n_patches = [
+            image_size[d] // patch_size[d] for d in range(self.spatial_dims)
+        ]
+
+        self.output_head = nn.Sequential(
+            Rearrange(
+                "b (nh nw) c -> b c nh nw",
+                nh=self.n_patches[0],
+                nw=self.n_patches[1],
+            ),
+            getattr(nn, f"ConvTranspose{self.spatial_dims}d")(
+                in_channels=self.embed_dim,
+                out_channels=self.image_channels,
+                kernel_size=patch_size,
+                stride=patch_size,
+            ),
+        )
+
+
 class Parallel(nn.Module):
     def __init__(self, fns):
         super().__init__()
@@ -166,7 +194,6 @@ class ViT(nn.Module):
         image_size=(256, 256),
         patch_size=(16, 16),
         output_head=None,
-        class_token=False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -193,31 +220,11 @@ class ViT(nn.Module):
             Rearrange("b c h w -> b (h w) c"),
         )
 
-        # this seems to have less patch artifacts vs conv
-        # patch_dim = patch_size[0] * patch_size[1] * image_channels
-        # self.patch_embed = nn.Sequential(
-        #     Rearrange(
-        #         "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
-        #         p1=patch_size[0],
-        #         p2=patch_size[1],
-        #         nh=self.n_patches[0],
-        #         nw=self.n_patches[1],
-        #     ),
-        #     nn.LayerNorm(patch_dim),
-        #     nn.Linear(patch_dim, embed_dim),
-        #     nn.LayerNorm(embed_dim),
-        # )
-
         self.positional_encoding = nn.Parameter(
             torch.randn(
-                1, np.prod(self.n_patches) + (1 if class_token else 0), embed_dim
-            )  # extra dim at front for batch, extra dim in middle for class token
+                1, np.prod(self.n_patches), embed_dim
+            )  # extra dim at front for batch
         )
-
-        if class_token:
-            self.class_token = nn.Parameter(torch.randn(1, 1, embed_dim))
-        else:
-            self.class_token = None
 
         self.dropout = nn.Dropout(dropout)
 
@@ -232,32 +239,10 @@ class ViT(nn.Module):
 
         # # output head here ...
         if output_head is None:
-            self.output_head = nn.Sequential(
-                Rearrange(
-                    "b (nh nw) c -> b c nh nw",
-                    nh=self.n_patches[0],
-                    nw=self.n_patches[1],
-                ),
-                nn.ConvTranspose2d(
-                    in_channels=embed_dim,
-                    out_channels=image_channels,
-                    kernel_size=patch_size,
-                    stride=patch_size,
-                ),
+            self.output_head = DebedHead(
+                embed_dim, image_channels, image_size, patch_size
             )
 
-            # self.output_head = nn.Sequential(
-            #     nn.LayerNorm(embed_dim),
-            #     nn.Linear(embed_dim, patch_size[0] * patch_size[1] * image_channels),
-            #     nn.LayerNorm(patch_size[0] * patch_size[1] * image_channels),
-            #     Rearrange(
-            #         "b (nh nw) (p1 p2 c) -> b c (nh p1) (nw p2)",
-            #         p1=patch_size[0],
-            #         p2=patch_size[1],
-            #         nh=self.n_patches[0],
-            #         nw=self.n_patches[1],
-            #     ),
-            # )
         else:
             self.output_head = output_head
 
@@ -267,11 +252,6 @@ class ViT(nn.Module):
         # embed
         x = self.patch_embed(x)
 
-        # add class token if necessary
-        if self.class_token is not None:
-            class_token = repeat(self.class_token, "1 1 d -> b 1 d", b=B)
-            x = torch.cat((x, class_token), dim=1)
-
         # add positional encoding and do dropout
         x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
 
@@ -280,12 +260,6 @@ class ViT(nn.Module):
 
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
-
-        # # extract class token if necessary
-        # if self.class_token is not None:
-        #     x = x[:, -1, :]
-        # else:
-        #     x = x.mean(dim=1)
 
         x = self.output_head(x)
 
