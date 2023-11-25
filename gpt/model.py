@@ -74,49 +74,39 @@ class Lambda(nn.Module):
 
 
 class ClassificationHead(nn.Module):
-    def __init__(self, in_dims, num_classes, pool="cls"):
-        assert pool in {
-            "cls",
-            "mean",
-        }, f"pool must be one of 'cls' or 'mean', got {pool}"
+    def __init__(self, in_dims, num_classes):
         super().__init__()
-        self.pool = pool
         self.proj = nn.Linear(in_dims, num_classes)
 
     def forward(self, x):
-        if self.pool == "cls":
-            x = x[:, -1]
-        elif self.pool == "mean":
-            x = x.mean(dim=1)
+        x = x.mean(dim=1)
         return self.proj(x)
 
 
 class DebedHead(nn.Module):
     def __init__(self, in_channels, out_channels, image_size, patch_size):
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.image_size = image_size
-        self.patch_size = patch_size
+        super().__init__()
         assert len(image_size) == len(patch_size)
-        self.spatial_dims = len(image_size)
-        assert self.spatial_dims <= 3, "spatial dims must be 1, 2, or 3"
-        self.n_patches = [
-            image_size[d] // patch_size[d] for d in range(self.spatial_dims)
-        ]
+        spatial_dims = len(image_size)
+        assert spatial_dims <= 3, "spatial dims must be 1, 2, or 3"
+        n_patches = [image_size[d] // patch_size[d] for d in range(spatial_dims)]
 
-        self.output_head = nn.Sequential(
+        self.debed = nn.Sequential(
             Rearrange(
                 "b (nh nw) c -> b c nh nw",
-                nh=self.n_patches[0],
-                nw=self.n_patches[1],
+                nh=n_patches[0],
+                nw=n_patches[1],
             ),
-            getattr(nn, f"ConvTranspose{self.spatial_dims}d")(
-                in_channels=self.embed_dim,
-                out_channels=self.image_channels,
+            nn.ConvTranspose2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
                 kernel_size=patch_size,
                 stride=patch_size,
             ),
         )
+
+    def forward(self, x):
+        return self.debed(x)
 
 
 class Parallel(nn.Module):
@@ -155,9 +145,6 @@ class TransformerBlock(nn.Module):
         x = x + self.attns(self.ln1(x))
         x = x + self.mlps(self.ln2(x))
         return x
-        # x = x + self.attns(x)
-        # x = x + self.mlps(x)
-        # return self.ln(x)
 
 
 class InstanceNormXd(nn.Module):
@@ -185,9 +172,9 @@ class InstanceNormXd(nn.Module):
 class ViT(nn.Module):
     def __init__(
         self,
-        num_heads=12,
         embed_dim=768,
         mlp_dim=768 * 4,
+        num_heads=12,
         dropout=0.1,
         num_blocks=6,
         image_channels=3,
@@ -197,6 +184,10 @@ class ViT(nn.Module):
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.mlp_dim = mlp_dim
+        self.num_heads = num_heads
+        self.num_blocks = num_blocks
+        self.image_channels = image_channels
         self.image_size = image_size
         self.patch_size = patch_size
         self.spatial_dims = len(image_size)
@@ -209,15 +200,20 @@ class ViT(nn.Module):
             [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
         )
 
-        # # embedding
+        patch_dim = np.prod(patch_size) * image_channels
+
+        self.to_patch = Rearrange(
+            "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
+            p1=patch_size[0],
+            p2=patch_size[1],
+            nh=self.n_patches[0],
+            nw=self.n_patches[1],
+        )
+
         self.patch_embed = nn.Sequential(
-            nn.Conv2d(
-                in_channels=image_channels,
-                out_channels=embed_dim,
-                kernel_size=patch_size,
-                stride=patch_size,
-            ),
-            Rearrange("b c h w -> b (h w) c"),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
         )
 
         self.positional_encoding = nn.Parameter(
@@ -249,8 +245,11 @@ class ViT(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # embed
-        x = self.patch_embed(x)
+        # split into patches
+        x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
+
+        # embed patches
+        x = self.patch_embed(x)  # (b, n_patches, embed_dim)
 
         # add positional encoding and do dropout
         x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
@@ -276,6 +275,125 @@ class ViT(nn.Module):
     def unfreeze(self):
         for p in self.parameters():
             p.requires_grad = True
+
+
+class MAE(nn.Module):
+    def __init__(
+        self,
+        vit,
+        masking_fraction,
+        decoder_dim=256,
+        decoder_num_heads=8,
+        decoder_num_blocks=4,
+        decoder_dropout=0.1,
+    ):
+        super().__init__()
+        self.vit = vit
+        self.masking_fraction = masking_fraction
+        self.mask_token = nn.Parameter(torch.randn(decoder_dim))
+        self.positional_encoding = nn.Parameter(
+            torch.randn(self.vit.positional_encoding.shape)
+        )
+        self.decoder_dim = decoder_dim
+        self.decoder_num_heads = decoder_num_heads
+        self.decoder_num_blocks = decoder_num_blocks
+        self.decoder_dropout = decoder_dropout
+        self.encoder_to_decoder = nn.Linear(self.vit.embed_dim, self.decoder_dim)
+        self.decoder = nn.Sequential(
+            *[
+                TransformerBlock(
+                    decoder_num_heads, decoder_dim, decoder_dim * 4, decoder_dropout
+                )
+                for _ in range(decoder_num_blocks)
+            ]
+        )  # transformer blocks
+
+        # self.debed = DebedHead(
+        #     decoder_dim,
+        #     vit.image_channels,
+        #     vit.image_size,
+        #     vit.patch_size,
+        # )
+
+        n_pixels_per_patch = np.prod(vit.patch_size) * vit.image_channels
+        self.debed = nn.Linear(decoder_dim, n_pixels_per_patch)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        patches = self.vit.to_patch(x)  # (b n_patches patch_dim)
+
+        tokens = self.vit.patch_embed(patches)  # (b n_patches embed_dim)
+
+        n_patches = tokens.shape[1]
+
+        # add positional encoding
+        tokens = tokens + self.vit.positional_encoding  # (batch, n_patches, embed_dim)
+
+        # make random indices to determine what gets masked/kept
+        rand_idxs = torch.rand(B, n_patches)
+        shuf_idxs = torch.argsort(rand_idxs)
+
+        num_masked = int(self.masking_fraction * n_patches)
+        # num_keep = n_patches - num_masked
+
+        mask_idx = shuf_idxs[:, :num_masked]  # front part is masked (removed)
+        keep_idx = shuf_idxs[
+            :, num_masked:
+        ]  # back part is kept and passed through encoder
+
+        batch_indexer = torch.arange(B).unsqueeze(-1)
+
+        # for masked parts, just keep the image patches (not embeddings)
+        masked_patches = patches[
+            batch_indexer, mask_idx
+        ]  # (batch, n_mask, n_pixels_per_patch)
+
+        # for unmasked parts, keep the tokens
+        keep_tokens = tokens[batch_indexer, keep_idx]  # (batch, n_keep, embed_dim)
+
+        # encode
+        encoded_tokens = self.vit.blocks(keep_tokens)  # (batch, n_keep, embed_dim)
+        encoded_tokens = self.vit.norm(keep_tokens)  # (batch, n_keep, embed_dim)
+
+        # project to decoder dim
+        unmask_tokens = self.encoder_to_decoder(
+            encoded_tokens
+        )  # (batch, n_keep, decoder_dim)
+
+        # repeat the mask token
+        mask_tokens = repeat(
+            self.mask_token, "d -> b n d", b=B, n=num_masked
+        )  # (batch, n_mask, decoder_dim)
+
+        # join the mask tokens back up with the unmasked/encoded tokens
+        full_tokens = torch.cat(
+            (mask_tokens, unmask_tokens), axis=1
+        )  # (batch, n_patches, decoder_dim)
+
+        # unshuffle
+        unshuf_idx = torch.argsort(shuf_idxs)
+        full_tokens = full_tokens[
+            batch_indexer, unshuf_idx
+        ]  # (batch, n_patches, decoder_dim)
+
+        # add positional embeddings
+        full_tokens = (
+            full_tokens + self.positional_encoding
+        )  # (batch, n_patches, decoder_dim)
+
+        # decode
+        decoded_tokens = self.decoder(full_tokens)  # (batch, n_patches, decoder_dim)
+
+        # extract the masked tokens
+        masked_tokens = decoded_tokens[
+            batch_indexer, mask_idx
+        ]  # (batch, n_mask, decoder_dim)
+
+        # project back to image patches
+        out = self.debed(masked_tokens)  # (batch, n_mask, n_pixels_per_patch)
+
+        return masked_patches, out
 
 
 class LightningWrapper(pl.LightningModule):
