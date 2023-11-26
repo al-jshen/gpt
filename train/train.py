@@ -15,7 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning.pytorch as pl
-from gpt.model import ViT, LightningWrapper, ClassificationHead
+from gpt.model import ViT, LightningWrapper, ClassificationHead, LightningMAE
 from gpt.alt_model import ViT as AltViT
 from gpt.data import CIFAR10DataModule, MNISTDataModule, AddGaussianNoise
 
@@ -40,17 +40,15 @@ elif args.task == "reconstruction":
             x,
         )
 
+elif args.task == "mae":
+
+    def collate(lop):
+        x, _ = zip(*lop)
+        x = torch.stack(x)
+        return x
+
 else:
     raise ValueError("Invalid task")
-
-if args.augment == "none":
-    extra_transforms = []
-elif args.augment == "noise":
-    extra_transforms = []
-elif args.augment == "mask":
-    raise NotImplementedError("Masking not implemented")
-else:
-    raise ValueError("Invalid augment")
 
 
 if args.dataset == "cifar10":
@@ -62,7 +60,6 @@ if args.dataset == "cifar10":
         batch_size=args.batch_size,
         collate_fn=collate,
         num_workers=min(os.cpu_count(), 4),
-        extra_transforms=extra_transforms,
         root_dir=args.data_dir,
         pin_memory=True,
     )
@@ -75,7 +72,6 @@ elif args.dataset == "mnist":
         batch_size=args.batch_size,
         collate_fn=collate,
         num_workers=min(os.cpu_count(), 4),
-        extra_transforms=extra_transforms,
         root_dir=args.data_dir,
         pin_memory=True,
     )
@@ -93,7 +89,6 @@ if args.model == "vit":
         num_heads=8,
         num_blocks=2,
         dropout=0.1,
-        class_token=False,  # args.task == "classification",
         lr=2e-3,
         output_head=ClassificationHead(512, output_dim, "mean")
         if args.task == "classification"
@@ -122,8 +117,16 @@ elif args.model == "alt_vit":
 else:
     raise ValueError("Invalid model type")
 
+if args.task == "mae":
+    model = LightningMAE(
+        vit=model.model,
+        masking_fraction=args.masking_fraction,
+        loss_fn=F.mse_loss,
+        lr=1e-2,
+    )
+
 trainer = pl.Trainer(
-    accelerator="gpu",
+    accelerator=args.accelerator,
     devices=args.gpus,
     strategy=args.strategy,
     precision=args.precision,

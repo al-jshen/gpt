@@ -1,13 +1,15 @@
 [config]
-dataset = "cifar10" # [cifar10, mnist]
+dataset = "mnist" # [cifar10, mnist]
 model = "vit" # [vit, alt_vit]
-batch_size = 128
+batch_size = 64
 precision = "bf16-mixed" # [16-mixed, bf16-mixed, 32-true]
-task = "classification" # [classification, reconstruction]
+task = "mae" # [classification, reconstruction, mae]
+masking_fraction = 0.7
 augment = "none" # [none, noise, mask]
 strategy = "ddp" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_3]
-epochs = 40
+epochs = 10
 noise = 0.0
-gpus = 1
+accelerator = "cpu"
+gpus = 8
 load_ckpt = ""
-data_dir = "/scratch/gpfs/js5013/data/ml/"
+data_dir = "../data/ml/"

@@ -277,6 +277,55 @@ class ViT(nn.Module):
             p.requires_grad = True
 
 
+class LightningMAE(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+        assert "lr" in kwargs, "must have lr"
+        assert "loss_fn" in kwargs, "must have loss_fn"
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        # remove lr and loss_fn from kwargs
+        del kwargs["lr"]
+        del kwargs["loss_fn"]
+        # build model
+        self.model = MAE(**kwargs)
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        masked_patches, out_masked_patches = self.model(batch)
+        loss = self.loss_fn(out_masked_patches, masked_patches)
+        self.log(
+            "train_loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        masked_patches, out_masked_patches = self.model(batch)
+        loss = self.loss_fn(out_masked_patches, masked_patches)
+        self.log(
+            "val_loss",
+            loss,
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        return loss
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+
 class MAE(nn.Module):
     def __init__(
         self,
