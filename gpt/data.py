@@ -24,8 +24,6 @@ class DataModule(pl.LightningDataModule):
         self.testset = None
 
     def prepare_data(self):
-        # torchvision.datasets.CIFAR10(root=self.root_dir, train=True, download=True)
-        # torchvision.datasets.CIFAR10(root=self.root_dir, train=False, download=True)
         raise NotImplementedError
 
     def setup(self, stage=None):
@@ -71,7 +69,6 @@ class CIFAR10DataModule(DataModule):
         collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
-        extra_target_transforms=[],
     ):
         super().__init__(
             batch_size=batch_size,
@@ -80,16 +77,30 @@ class CIFAR10DataModule(DataModule):
             collate_fn=collate_fn,
             root_dir=root_dir,
         )
+
+        self.normalization_means = torch.tensor(
+            [x / 255.0 for x in [125.3, 123.0, 113.9]]
+        )
+        self.normalization_stds = torch.tensor([x / 255.0 for x in [63.0, 62.1, 66.7]])
+
         self.transform = transforms.Compose(
             [
                 transforms.ToTensor(),
                 transforms.Normalize(
-                    mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
-                    std=[x / 255.0 for x in [63.0, 62.1, 66.7]],
+                    mean=self.normalization_means,
+                    std=self.normalization_stds,
                 ),
                 *extra_transforms,
             ]
         )
+
+    def unnormalize(self, x):
+        inv_normalization = transforms.Normalize(
+            mean=-self.normalization_means / self.normalization_stds,
+            std=1 / self.normalization_stds,
+        )
+
+        return inv_normalization(x)
 
     @property
     def classes(self):
@@ -147,13 +158,24 @@ class MNISTDataModule(DataModule):
             root_dir=root_dir,
             collate_fn=collate_fn,
         )
+        self.normalization_means = torch.tensor([0.1307])
+        self.normalization_stds = torch.tensor([0.3081])
+
         self.transform = transforms.Compose(
             [
                 transforms.ToTensor(),
-                transforms.Normalize((0.1307,), (0.3081,)),
+                transforms.Normalize(self.normalization_means, self.normalization_stds),
                 *extra_transforms,
             ]
         )
+
+    def unnormalize(self, x):
+        inv_normalization = transforms.Normalize(
+            mean=-self.normalization_means / self.normalization_stds,
+            std=1 / self.normalization_stds,
+        )
+
+        return inv_normalization(x)
 
     def prepare_data(self):
         torchvision.datasets.MNIST(root=self.root_dir, train=True, download=True)

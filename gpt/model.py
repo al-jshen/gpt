@@ -177,6 +177,7 @@ class ViT(nn.Module):
         num_heads=12,
         dropout=0.1,
         num_blocks=6,
+        parallel_paths=2,
         image_channels=3,
         image_size=(256, 256),
         patch_size=(16, 16),
@@ -187,6 +188,7 @@ class ViT(nn.Module):
         self.mlp_dim = mlp_dim
         self.num_heads = num_heads
         self.num_blocks = num_blocks
+        self.parallel_paths = parallel_paths
         self.image_channels = image_channels
         self.image_size = image_size
         self.patch_size = patch_size
@@ -226,7 +228,7 @@ class ViT(nn.Module):
 
         self.blocks = nn.Sequential(
             *[
-                TransformerBlock(num_heads, embed_dim, mlp_dim, dropout)
+                TransformerBlock(num_heads, embed_dim, mlp_dim, dropout, parallel_paths)
                 for _ in range(num_blocks)
             ]
         )  # transformer blocks
@@ -294,9 +296,17 @@ class LightningMAE(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
+    def _step(self, batch, batch_idx):
+        mask_patches, out_mask_patches, mask_idx = self.model(batch)
+        batch_indexer = torch.arange(batch.shape[0]).unsqueeze(-1)
+        loss = self.loss_fn(
+            out_mask_patches[batch_indexer, mask_idx],
+            mask_patches[batch_indexer, mask_idx],
+        )
+        return loss
+
     def training_step(self, batch, batch_idx):
-        mask_patches, out_mask_patches = self.model(batch)
-        loss = self.loss_fn(out_mask_patches, mask_patches)
+        loss = self._step(batch, batch_idx)
         self.log(
             "train_loss",
             loss,
@@ -309,8 +319,7 @@ class LightningMAE(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        mask_patches, out_mask_patches = self.model(batch)
-        loss = self.loss_fn(out_mask_patches, mask_patches)
+        loss = self._step(batch, batch_idx)
         self.log(
             "val_loss",
             loss,
@@ -373,14 +382,14 @@ class MAE(nn.Module):
         tokens = tokens + self.vit.positional_encoding  # (batch, n_patches, embed_dim)
 
         # make random indices to determine what gets mask/kept
-        rand_idxs = torch.rand(B, n_patches)
-        shuf_idxs = torch.argsort(rand_idxs, dim=1)
-        unshuf_idxs = torch.argsort(shuf_idxs, dim=1)
+        rand_idx = torch.rand(B, n_patches)
+        shuf_idx = torch.argsort(rand_idx, dim=1)
+        unshuf_idx = torch.argsort(shuf_idx, dim=1)
 
         num_mask = int(self.masking_fraction * n_patches)
 
-        mask_idx = shuf_idxs[:, :num_mask]  # front part is mask (removed)
-        unmask_idx = shuf_idxs[
+        mask_idx = shuf_idx[:, :num_mask]  # front part is mask (removed)
+        unmask_idx = shuf_idx[
             :, num_mask:
         ]  # back part is kept unmasked and passed through encoder
 

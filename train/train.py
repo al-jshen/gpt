@@ -7,6 +7,7 @@ parser.add_argument("--config", type=str, default="config.toml")
 args = parser.parse_args()
 
 cfg = munch.munchify(toml.load(args.config))
+
 del args
 args = cfg.config
 
@@ -53,7 +54,7 @@ else:
 
 if args.dataset == "cifar10":
     image_size = (32, 32)
-    patch_size = (4, 4)
+    patch_size = (2, 2)
     image_channels = 3
     output_dim = 10
     datamodule = CIFAR10DataModule(
@@ -86,8 +87,9 @@ if args.model == "vit":
         image_channels=image_channels,
         embed_dim=512,
         mlp_dim=1024,
-        num_heads=8,
+        num_heads=16,
         num_blocks=2,
+        parallel_paths=2,
         dropout=0.1,
         lr=2e-3,
         output_head=ClassificationHead(512, output_dim, "mean")
@@ -122,20 +124,28 @@ if args.task == "mae":
         vit=model.model,
         masking_fraction=args.masking_fraction,
         loss_fn=F.mse_loss,
-        lr=1e-2,
+        lr=1e-3,
     )
 
-trainer = pl.Trainer(
-    accelerator=args.accelerator,
-    devices=args.gpus,
-    strategy=args.strategy,
-    precision=args.precision,
-    gradient_clip_val=1.0,
-    max_epochs=args.epochs,
-    enable_model_summary=True,
-    enable_progress_bar=True,
-    profiler="simple",
-)
-trainer.fit(
-    model, datamodule, ckpt_path=args.load_ckpt if args.load_ckpt != "" else None
-)
+if not args.train:
+    datamodule.setup()
+    tl = datamodule.train_dataloader()
+    b = next(iter(tl))
+    out = model(b)
+    print(out[0].shape, out[1].shape)
+
+else:
+    trainer = pl.Trainer(
+        accelerator=args.accelerator,
+        devices=args.gpus,
+        strategy=args.strategy,
+        precision=args.precision,
+        gradient_clip_val=1.0,
+        max_epochs=args.epochs,
+        enable_model_summary=True,
+        enable_progress_bar=True,
+        profiler="simple",
+    )
+    trainer.fit(
+        model, datamodule, ckpt_path=args.load_ckpt if args.load_ckpt != "" else None
+    )
