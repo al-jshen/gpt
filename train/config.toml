@@ -1,14 +1,12 @@
 [config]
 dataset = "mnist" # [cifar10, mnist]
-model = "vit" # [vit, alt_vit]
+model = "vit" # [vit]
 batch_size = 256
 precision = "bf16-mixed" # [16-mixed, bf16-mixed, 32-true]
 task = "mae" # [classification, reconstruction, mae]
 masking_fraction = 0.8
-augment = "none" # [none, noise, mask]
 strategy = "ddp_find_unused_parameters_true" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_3]
-epochs = 20
-noise = 0.0
+epochs = 30
 accelerator = "gpu"
 gpus = 1
 load_ckpt = ""
