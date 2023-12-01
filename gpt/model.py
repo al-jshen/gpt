@@ -160,7 +160,7 @@ class InstanceNormXd(nn.Module):
         n_spatial_dims = len(x.shape) - 2
         assert n_spatial_dims >= 1
         std_dims = tuple(range(2, n_spatial_dims + 2))
-        std = torch.std(x, dim=std_dims, keepdim=True)
+        std = torch.std(x, dim=std_dims, unmaskdim=True)
         x = (x) / (std + self.eps)
         x = (
             x * self.weight[None, :, *(None,) * n_spatial_dims]
@@ -295,8 +295,8 @@ class LightningMAE(pl.LightningModule):
         return self.model(x)
 
     def training_step(self, batch, batch_idx):
-        masked_patches, out_masked_patches = self.model(batch)
-        loss = self.loss_fn(out_masked_patches, masked_patches)
+        mask_patches, out_mask_patches = self.model(batch)
+        loss = self.loss_fn(out_mask_patches, mask_patches)
         self.log(
             "train_loss",
             loss,
@@ -309,8 +309,8 @@ class LightningMAE(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        masked_patches, out_masked_patches = self.model(batch)
-        loss = self.loss_fn(out_masked_patches, masked_patches)
+        mask_patches, out_mask_patches = self.model(batch)
+        loss = self.loss_fn(out_mask_patches, mask_patches)
         self.log(
             "val_loss",
             loss,
@@ -338,11 +338,11 @@ class MAE(nn.Module):
     ):
         super().__init__()
         self.vit = vit
+        num_patches = np.prod(vit.n_patches)
         self.masking_fraction = masking_fraction
         self.mask_token = nn.Parameter(torch.randn(decoder_dim))
-        self.positional_encoding = nn.Parameter(
-            torch.randn(self.vit.positional_encoding.shape)
-        )
+        self.positional_encoding = nn.Parameter(torch.randn(num_patches, decoder_dim))
+        # self.positional_encoding = nn.Embedding(num_patches, decoder_dim)
         self.decoder_dim = decoder_dim
         self.decoder_num_heads = decoder_num_heads
         self.decoder_num_blocks = decoder_num_blocks
@@ -356,13 +356,6 @@ class MAE(nn.Module):
                 for _ in range(decoder_num_blocks)
             ]
         )  # transformer blocks
-
-        # self.debed = DebedHead(
-        #     decoder_dim,
-        #     vit.image_channels,
-        #     vit.image_size,
-        #     vit.patch_size,
-        # )
 
         n_pixels_per_patch = np.prod(vit.patch_size) * vit.image_channels
         self.debed = nn.Linear(decoder_dim, n_pixels_per_patch)
@@ -379,70 +372,86 @@ class MAE(nn.Module):
         # add positional encoding
         tokens = tokens + self.vit.positional_encoding  # (batch, n_patches, embed_dim)
 
-        # make random indices to determine what gets masked/kept
+        # make random indices to determine what gets mask/kept
         rand_idxs = torch.rand(B, n_patches)
-        shuf_idxs = torch.argsort(rand_idxs)
+        shuf_idxs = torch.argsort(rand_idxs, dim=1)
+        unshuf_idxs = torch.argsort(shuf_idxs, dim=1)
 
-        num_masked = int(self.masking_fraction * n_patches)
-        # num_keep = n_patches - num_masked
+        num_mask = int(self.masking_fraction * n_patches)
 
-        mask_idx = shuf_idxs[:, :num_masked]  # front part is masked (removed)
-        keep_idx = shuf_idxs[
-            :, num_masked:
-        ]  # back part is kept and passed through encoder
+        mask_idx = shuf_idxs[:, :num_mask]  # front part is mask (removed)
+        unmask_idx = shuf_idxs[
+            :, num_mask:
+        ]  # back part is kept unmasked and passed through encoder
 
         batch_indexer = torch.arange(B).unsqueeze(-1)
 
-        # for masked parts, just keep the image patches (not embeddings)
-        masked_patches = patches[
+        # for mask parts, just unmask the image patches (not embeddings)
+        mask_patches = patches[
             batch_indexer, mask_idx
         ]  # (batch, n_mask, n_pixels_per_patch)
 
-        # for unmasked parts, keep the tokens
-        keep_tokens = tokens[batch_indexer, keep_idx]  # (batch, n_keep, embed_dim)
+        # for unmask parts, unmask the tokens
+        unmask_tokens = tokens[
+            batch_indexer, unmask_idx
+        ]  # (batch, n_unmask, embed_dim)
 
         # encode
-        encoded_tokens = self.vit.blocks(keep_tokens)  # (batch, n_keep, embed_dim)
-        encoded_tokens = self.vit.norm(keep_tokens)  # (batch, n_keep, embed_dim)
+        encoded_tokens = self.vit.blocks(unmask_tokens)  # (batch, n_unmask, embed_dim)
+        encoded_tokens = self.vit.norm(unmask_tokens)  # (batch, n_unmask, embed_dim)
 
         # project to decoder dim
         unmask_tokens = self.encoder_to_decoder(
             encoded_tokens
-        )  # (batch, n_keep, decoder_dim)
+        )  # (batch, n_unmask, decoder_dim)
+
+        # add positional encoding
+        unmask_tokens = (
+            unmask_tokens + self.positional_encoding[unmask_idx, :]
+        )  # self.positional_encoding(unmask_idx) for nn.Embedding
 
         # repeat the mask token
         mask_tokens = repeat(
-            self.mask_token, "d -> b n d", b=B, n=num_masked
+            self.mask_token, "d -> b n d", b=B, n=num_mask
         )  # (batch, n_mask, decoder_dim)
 
-        # join the mask tokens back up with the unmasked/encoded tokens
+        # add positional encoding
+        mask_tokens = (
+            mask_tokens + self.positional_encoding[mask_idx, :]
+        )  # self.positional_encoding(mask_idx) for nn.Embedding
+
+        # full_tokens = torch.zeros(B, n_patches, self.decoder_dim, device=x.device)
+
+        # full_tokens[batch_indexer, mask_idx] = mask_tokens
+        # full_tokens[batch_indexer, unmask_idx] = unmask_tokens
+
+        # join the mask tokens back up with the unmask/encoded tokens
         full_tokens = torch.cat(
             (mask_tokens, unmask_tokens), axis=1
         )  # (batch, n_patches, decoder_dim)
 
         # unshuffle
-        unshuf_idx = torch.argsort(shuf_idxs)
         full_tokens = full_tokens[
             batch_indexer, unshuf_idx
         ]  # (batch, n_patches, decoder_dim)
 
-        # add positional embeddings
-        full_tokens = (
-            full_tokens + self.positional_encoding
-        )  # (batch, n_patches, decoder_dim)
+        # # add positional embeddings
+        # full_tokens = (
+        #     full_tokens + self.positional_encoding
+        # )  # (batch, n_patches, decoder_dim)
 
         # decode
         decoded_tokens = self.decoder(full_tokens)  # (batch, n_patches, decoder_dim)
 
-        # extract the masked tokens
-        masked_tokens = decoded_tokens[
-            batch_indexer, mask_idx
-        ]  # (batch, n_mask, decoder_dim)
+        # # extract the mask tokens
+        # mask_tokens = decoded_tokens[
+        #     batch_indexer, mask_idx
+        # ]  # (batch, n_mask, decoder_dim)
 
         # project back to image patches
-        out = self.debed(masked_tokens)  # (batch, n_mask, n_pixels_per_patch)
+        out = self.debed(decoded_tokens)  # (batch, n_patches, n_pixels_per_patch)
 
-        return masked_patches, out
+        return patches, out, mask_idx
 
 
 class LightningWrapper(pl.LightningModule):
