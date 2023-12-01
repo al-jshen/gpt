@@ -285,11 +285,13 @@ class LightningMAE(pl.LightningModule):
         self.save_hyperparameters()
         assert "lr" in kwargs, "must have lr"
         assert "loss_fn" in kwargs, "must have loss_fn"
+        if "logging" not in kwargs:
+            kwargs["logging"] = True
         for k, v in kwargs.items():
             setattr(self, k, v)
         # remove lr and loss_fn from kwargs
-        del kwargs["lr"]
-        del kwargs["loss_fn"]
+        for k in ["lr", "loss_fn", "logging"]:
+            del kwargs[k]
         # build model
         self.model = MAE(**kwargs)
 
@@ -305,30 +307,31 @@ class LightningMAE(pl.LightningModule):
         )
         return loss
 
+    def _log(self, log_name, loss):
+        if self.logging:
+            self.log(
+                log_name,
+                loss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
     def training_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx)
-        self.log(
-            "train_loss",
-            loss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
+        self._log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx)
-        self.log(
-            "val_loss",
-            loss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
+        self._log("val_loss", loss)
+        return loss
+
+    def testing_step(self, batch, batch_idx):
+        loss = self._step(batch, batch_idx)
+        self._log("test_loss", loss)
         return loss
 
     def configure_optimizers(self):
@@ -471,61 +474,117 @@ class LightningWrapper(pl.LightningModule):
     def __init__(self, modelclass, **kwargs):
         super().__init__()
         self.save_hyperparameters()
+
+        # self._build_steps()
+
         assert "lr" in kwargs, "must have lr"
         assert "loss_fn" in kwargs, "must have loss_fn"
+        if "logging" not in kwargs:
+            kwargs["logging"] = True
         for k, v in kwargs.items():
-            setattr(self, k, v)
-        # remove lr and loss_fn from kwargs
-        del kwargs["lr"]
-        del kwargs["loss_fn"]
+            if not k.startswith("inner_"):
+                setattr(self, k, v)
+
+        self.modelclass = modelclass
+        if issubclass(modelclass, pl.LightningModule):
+            self.wraps_lightning = True
+            inner_kwargs = {}
+
+            for k, v in kwargs.items():
+                # if there is the same key but with inner_, use that
+                if f"inner_{k}" in kwargs:
+                    inner_kwargs[k] = kwargs[f"inner_{k}"]
+                else:
+                    if not k.startswith("inner_"):
+                        inner_kwargs[k] = v
+                    else:
+                        inner_kwargs[k.replace("inner_", "")] = v
+
+            # logging handled by outer wrapper
+            inner_kwargs["logging"] = False
+
+        else:
+            self.wraps_lightning = False
+            # remove lr and loss_fn from kwargs
+            inner_kwargs = kwargs.copy()
+            del_keys = ["lr", "loss_fn", "logging"]
+            for k in del_keys:
+                if k in inner_kwargs:
+                    del inner_kwargs[k]
+
         # build model
-        self.model = modelclass(**kwargs)
+        if "checkpoint" in kwargs:
+            self.model = kwargs["checkpoint"]
+        else:
+            self.model = modelclass(**inner_kwargs)
 
     def forward(self, x):
         return self.model(x)
 
-    def training_step(self, batch, batch_idx):
+    def _step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
         loss = self.loss_fn(y_hat, y)
-        self.log(
-            "train_loss",
-            loss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
+        return loss
+
+    def _log(self, log_name, loss):
+        if self.logging:
+            self.log(
+                log_name,
+                loss,
+                prog_bar=True,
+                logger=True,
+                on_step=True,
+                on_epoch=True,
+                sync_dist=True,
+            )
+
+    # def _build_steps(self):
+    #     steps = [
+    #         ("training_step", "train_loss"),
+    #         ("validation_step", "val_loss"),
+    #         ("testing_step", "test_loss"),
+    #     ]
+    #     build_fn = lambda step_name, log_name: textwrap.dedent(
+    #         f"""\
+    #         def {step_name}(self, batch, batch_idx):
+    #             if self.wraps_lightning:
+    #                 loss = self.model.{step_name}(batch, batch_idx)
+    #             else:
+    #                 loss = self._step(batch, batch_idx)
+    #             self._log("{log_name}", loss)
+    #             return loss
+    #     """
+    #     )
+    #     step_fns = {}
+    #     for step_name, log_name in steps:
+    #         exec(build_fn(step_name, log_name), step_fns)
+    #     for f in step_fns:
+    #         setattr(self, f, step_fns[f])
+
+    def training_step(self, batch, batch_idx):
+        if self.wraps_lightning:
+            loss = self.model.training_step(batch, batch_idx)
+        else:
+            loss = self._step(batch, batch_idx)
+        self._log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = self.loss_fn(y_hat, y)
-        self.log(
-            "val_loss",
-            loss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
+        if self.wraps_lightning:
+            loss = self.model.validation_step(batch, batch_idx)
+        else:
+            loss = self._step(batch, batch_idx)
+        self._log("val_loss", loss)
+        return loss
 
     def testing_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self(x)
-        loss = self.loss_fn(y_hat, y)
-        self.log(
-            "test_loss",
-            loss,
-            prog_bar=True,
-            logger=True,
-            on_step=True,
-            on_epoch=True,
-            sync_dist=True,
-        )
+        if self.wraps_lightning:
+            loss = self.model.validation_step(batch, batch_idx)
+        else:
+            loss = self._step(batch, batch_idx)
+        self._log("test_loss", loss)
+        return loss
 
     def configure_optimizers(self):
         return torch.optim.Adam(
