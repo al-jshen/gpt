@@ -2,6 +2,8 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 import lightning.pytorch as pl
+from collections import Counter
+from torch.utils.data import Subset
 
 
 class DataModule(pl.LightningDataModule):
@@ -12,6 +14,7 @@ class DataModule(pl.LightningDataModule):
         pin_memory=True,
         collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
+        nshot=None,
     ):
         super().__init__()
         self.batch_size = batch_size
@@ -22,16 +25,49 @@ class DataModule(pl.LightningDataModule):
         self.transform = NotImplemented
         self.trainset = None
         self.testset = None
+        self.train_subset_indices = None
+        self.nshot = nshot
+
+    @property
+    def classes(self):
+        raise NotImplementedError
+
+    @property
+    def num_classes(self):
+        return len(self.classes)
 
     def prepare_data(self):
         raise NotImplementedError
 
     def setup(self, stage=None):
+        if self.nshot is not None:
+            self.setup_nshot(self.nshot)
+        else:
+            self._setup(stage)
+
+    def _setup(self, stage=None):
         raise NotImplementedError
+
+    def setup_nshot(self, n):
+        self._setup()
+        subset_ctr = Counter({k: n for k in self.classes})
+        subset_idx = set()
+
+        ix = 0
+        while subset_ctr.total() > 0:
+            c = self.classes[self.trainset.targets[ix]]
+            if subset_ctr[c] > 0:
+                subset_ctr[c] -= 1
+                subset_idx.add(ix)
+            ix += 1
+
+        self.train_subset_indices = list(subset_idx)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(
-            self.trainset,
+            self.trainset
+            if self.train_subset_indices is None
+            else Subset(self.trainset, self.train_subset_indices),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
@@ -69,6 +105,7 @@ class CIFAR10DataModule(DataModule):
         collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
+        nshot=None,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -76,6 +113,7 @@ class CIFAR10DataModule(DataModule):
             pin_memory=pin_memory,
             collate_fn=collate_fn,
             root_dir=root_dir,
+            nshot=nshot,
         )
 
         self.normalization_means = torch.tensor(
@@ -117,15 +155,11 @@ class CIFAR10DataModule(DataModule):
             "truck",
         ]
 
-    @property
-    def num_classes(self):
-        return len(self.classes)
-
     def prepare_data(self):
         torchvision.datasets.CIFAR10(root=self.root_dir, train=True, download=True)
         torchvision.datasets.CIFAR10(root=self.root_dir, train=False, download=True)
 
-    def setup(self, stage=None):
+    def _setup(self, stage=None):
         if stage == "fit" or stage is None:
             self.trainset = torchvision.datasets.CIFAR10(
                 root=self.root_dir,
@@ -150,6 +184,7 @@ class MNISTDataModule(DataModule):
         collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
+        nshot=None,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -157,6 +192,7 @@ class MNISTDataModule(DataModule):
             pin_memory=pin_memory,
             root_dir=root_dir,
             collate_fn=collate_fn,
+            nshot=nshot,
         )
         self.normalization_means = torch.tensor([0.1307])
         self.normalization_stds = torch.tensor([0.3081])
@@ -168,6 +204,10 @@ class MNISTDataModule(DataModule):
                 *extra_transforms,
             ]
         )
+
+    @property
+    def classes(self):
+        return list(range(10))
 
     def unnormalize(self, x):
         inv_normalization = transforms.Normalize(
@@ -181,7 +221,7 @@ class MNISTDataModule(DataModule):
         torchvision.datasets.MNIST(root=self.root_dir, train=True, download=True)
         torchvision.datasets.MNIST(root=self.root_dir, train=False, download=True)
 
-    def setup(self, stage=None):
+    def _setup(self, stage=None):
         if stage == "fit" or stage is None:
             self.trainset = torchvision.datasets.MNIST(
                 root=self.root_dir,
