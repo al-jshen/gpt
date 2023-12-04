@@ -13,5 +13,5 @@
 # export PYTHONFAULTHANDLER=1
 
 # run script from above
-# srun python3 train.py --config config.toml 
-srun python3 finetune.py --config config_finetune.toml 
+srun python3 train.py --config config.toml 
+# srun python3 finetune.py --config config_finetune.toml 

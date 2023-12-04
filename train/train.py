@@ -15,21 +15,27 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
 import lightning.pytorch as pl
-from gpt.model import ViT, LightningWrapper, ClassificationHead, LightningMAE
+from gpt.model import ViT, LightningWrapper, ClassificationHead, LightningMAE, Lambda
 from gpt.data import CIFAR10DataModule, MNISTDataModule
 
 torch.set_float32_matmul_precision("medium")
 
-## TODO: add augmentations (tencrop, noise, etc.)
-
 if args.task == "classification":
-    collate = None
+
+    def collate(lop):
+        x, y = zip(*lop)
+        x = torch.stack(x)
+        return x.view(-1, *x.shape[2:]), torch.tensor(y).unsqueeze(-1).repeat(
+            1, x.shape[1]
+        ).view(-1)
 elif args.task == "reconstruction":
 
     def collate(lop):
         x, _ = zip(*lop)
         x = torch.stack(x)
+        x = x.view(-1, *x.shape[2:])
         return (x, x)
 
 elif args.task == "mae":
@@ -37,6 +43,7 @@ elif args.task == "mae":
     def collate(lop):
         x, _ = zip(*lop)
         x = torch.stack(x)
+        x = x.view(-1, *x.shape[2:])
         return x
 
 else:
@@ -48,27 +55,37 @@ if args.dataset == "cifar10":
     patch_size = (4, 4)
     image_channels = 3
     output_dim = 10
-    datamodule = CIFAR10DataModule(
-        batch_size=args.batch_size,
-        collate_fn=collate,
-        num_workers=min(os.cpu_count(), 8),
-        root_dir=args.data_dir,
-        pin_memory=True,
-    )
+    dataclass = CIFAR10DataModule
+    extra_transforms = [
+        transforms.Resize(40, antialias=True),
+        transforms.FiveCrop(32),
+        Lambda(torch.stack),
+    ]
+
 elif args.dataset == "mnist":
     image_size = (28, 28)
     patch_size = (4, 4)
     image_channels = 1
     output_dim = 10
-    datamodule = MNISTDataModule(
-        batch_size=args.batch_size,
-        collate_fn=collate,
-        num_workers=min(os.cpu_count(), 8),
-        root_dir=args.data_dir,
-        pin_memory=True,
-    )
+    dataclass = MNISTDataModule
+    extra_transforms = [
+        transforms.Resize(36, antialias=True),
+        transforms.FiveCrop(28),
+        Lambda(torch.stack),
+    ]
 else:
     raise ValueError("Invalid dataset")
+
+
+datamodule = dataclass(
+    batch_size=args.batch_size,
+    collate_fn=collate,
+    num_workers=min(os.cpu_count(), 8),
+    root_dir=args.data_dir,
+    pin_memory=True,
+    nshot=args.nshot if args.nshot > 0 else None,
+    extra_transforms=extra_transforms,
+)
 
 if args.model == "vit":
     model = LightningWrapper(
@@ -79,11 +96,11 @@ if args.model == "vit":
         embed_dim=512,
         mlp_dim=1024,
         num_heads=16,
-        num_blocks=2,
+        num_blocks=3,
         parallel_paths=2,
         dropout=0.1,
-        lr=2e-3,
-        output_head=ClassificationHead(512, output_dim, "mean")
+        lr=1e-3,
+        output_head=ClassificationHead(512, output_dim)
         if args.task == "classification"
         else None,
         loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,
@@ -98,10 +115,15 @@ if args.task == "mae":
         LightningMAE,
         vit=model.model,
         masking_fraction=args.masking_fraction,
-        decoder_num_blocks=2,
+        decoder_num_blocks=1,
+        logging=True,
+        inner_logging=False,
         loss_fn=F.mse_loss,
         lr=1e-3,
     )
+
+if args.compile:
+    model = torch.compile(model)
 
 if not args.train:
     datamodule.setup()
@@ -116,7 +138,7 @@ else:
         devices=args.gpus,
         strategy=args.strategy,
         precision=args.precision,
-        gradient_clip_val=1.0,
+        gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
         max_epochs=args.epochs,
         enable_model_summary=True,
         enable_progress_bar=True,

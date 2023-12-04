@@ -51,9 +51,7 @@ datamodule = dataclass(
     num_workers=min(os.cpu_count(), 8),
     root_dir=args.data_dir,
     pin_memory=True,
-    train_subset_indices=range(args.train_subset)
-    if args.train_subset != "none"
-    else None,
+    nshot=args.nshot if args.nshot > 0 else None,
 )
 
 # set up model
@@ -61,17 +59,19 @@ ckpt = LightningWrapper.load_from_checkpoint(args.model_path)
 
 if args.model == "mae":
     _model = ckpt.vit
-    _model.output_head = ClassificationHead(_model.embed_dim, output_dim)
-    model = LightningWrapper(
-        ViT,
-        checkpoint=_model,  # ViT torch model
-        loss_fn=loss_fn,
-        lr=1e-4,
-    )
 elif args.model == "vit":
-    raise NotImplementedError
+    _model = ckpt.model
+
 else:
     raise ValueError("Invalid model type")
+
+_model.output_head = ClassificationHead(_model.embed_dim, output_dim)
+model = LightningWrapper(
+    ViT,
+    checkpoint=_model,  # ViT torch model
+    loss_fn=loss_fn,
+    lr=1e-4,
+)
 
 # train
 if not args.train:

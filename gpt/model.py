@@ -398,10 +398,9 @@ class MAE(nn.Module):
 
         batch_indexer = torch.arange(B).unsqueeze(-1)
 
-        # for mask parts, just unmask the image patches (not embeddings)
-        mask_patches = patches[
-            batch_indexer, mask_idx
-        ]  # (batch, n_mask, n_pixels_per_patch)
+        # mask_patches = patches[
+        #     batch_indexer, mask_idx
+        # ]  # (batch, n_mask, n_pixels_per_patch)
 
         # for unmask parts, unmask the tokens
         unmask_tokens = tokens[
@@ -432,11 +431,6 @@ class MAE(nn.Module):
             mask_tokens + self.positional_encoding[mask_idx, :]
         )  # self.positional_encoding(mask_idx) for nn.Embedding
 
-        # full_tokens = torch.zeros(B, n_patches, self.decoder_dim, device=x.device)
-
-        # full_tokens[batch_indexer, mask_idx] = mask_tokens
-        # full_tokens[batch_indexer, unmask_idx] = unmask_tokens
-
         # join the mask tokens back up with the unmask/encoded tokens
         full_tokens = torch.cat(
             (mask_tokens, unmask_tokens), axis=1
@@ -447,18 +441,8 @@ class MAE(nn.Module):
             batch_indexer, unshuf_idx
         ]  # (batch, n_patches, decoder_dim)
 
-        # # add positional embeddings
-        # full_tokens = (
-        #     full_tokens + self.positional_encoding
-        # )  # (batch, n_patches, decoder_dim)
-
         # decode
         decoded_tokens = self.decoder(full_tokens)  # (batch, n_patches, decoder_dim)
-
-        # # extract the mask tokens
-        # mask_tokens = decoded_tokens[
-        #     batch_indexer, mask_idx
-        # ]  # (batch, n_mask, decoder_dim)
 
         # project back to image patches
         out = self.debed(decoded_tokens)  # (batch, n_patches, n_pixels_per_patch)
@@ -518,6 +502,11 @@ class LightningWrapper(pl.LightningModule):
         else:
             self.model = modelclass(**inner_kwargs)
 
+        if self.wraps_lightning:
+            # if the model is a lightning module, we need to make sure it's not
+            # trying to log anything
+            self.model.logging = False
+
     def forward(self, x):
         return self.model(x)
 
@@ -538,29 +527,6 @@ class LightningWrapper(pl.LightningModule):
                 on_epoch=True,
                 sync_dist=True,
             )
-
-    # def _build_steps(self):
-    #     steps = [
-    #         ("training_step", "train_loss"),
-    #         ("validation_step", "val_loss"),
-    #         ("testing_step", "test_loss"),
-    #     ]
-    #     build_fn = lambda step_name, log_name: textwrap.dedent(
-    #         f"""\
-    #         def {step_name}(self, batch, batch_idx):
-    #             if self.wraps_lightning:
-    #                 loss = self.model.{step_name}(batch, batch_idx)
-    #             else:
-    #                 loss = self._step(batch, batch_idx)
-    #             self._log("{log_name}", loss)
-    #             return loss
-    #     """
-    #     )
-    #     step_fns = {}
-    #     for step_name, log_name in steps:
-    #         exec(build_fn(step_name, log_name), step_fns)
-    #     for f in step_fns:
-    #         setattr(self, f, step_fns[f])
 
     def training_step(self, batch, batch_idx):
         if self.wraps_lightning:

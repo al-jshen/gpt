@@ -5,12 +5,11 @@ model_path = "../train/lightning_logs/version_1031205/checkpoints/epoch=29-step=
 batch_size = 256
 precision = "bf16-mixed" # [16-mixed, bf16-mixed, 32-true]
 task = "classification" # [classification]
-masking_fraction = 0.8
 strategy = "ddp" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_3]
-epochs = 30
+epochs = 100
 accelerator = "gpu"
 gpus = 1
 load_ckpt = ""
 data_dir = "/scratch/gpfs/js5013/data/ml/"
 train = true
-train_subset = 100
+nshot = 5 # 0 for full training data
