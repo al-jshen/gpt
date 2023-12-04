@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 import lightning.pytorch as pl
 from gpt.model import ViT, LightningWrapper, ClassificationHead, LightningMAE, Lambda
-from gpt.data import CIFAR10DataModule, MNISTDataModule
+from gpt.data import CIFAR10DataModule, MNISTDataModule, ImagenetH5DataModule
 
 torch.set_float32_matmul_precision("medium")
 
@@ -51,28 +51,42 @@ else:
 
 
 if args.dataset == "cifar10":
-    image_size = (32, 32)
-    patch_size = (4, 4)
-    image_channels = 3
-    output_dim = 10
+    image_size = ((32, 32),)
+    patch_size = ((4, 4),)
+    image_channels = (3,)
+    output_dim = (10,)
+    kwargs = dict(
+        extra_transforms=[
+            transforms.Resize(40, antialias=True),
+            transforms.FiveCrop(32),
+            Lambda(torch.stack),
+        ],
+    )
     dataclass = CIFAR10DataModule
-    extra_transforms = [
-        transforms.Resize(40, antialias=True),
-        transforms.FiveCrop(32),
-        Lambda(torch.stack),
-    ]
 
 elif args.dataset == "mnist":
-    image_size = (28, 28)
-    patch_size = (4, 4)
-    image_channels = 1
-    output_dim = 10
+    image_size = ((28, 28),)
+    patch_size = ((4, 4),)
+    image_channels = (1,)
+    output_dim = (10,)
+    kwargs = dict(
+        extra_transforms=[
+            transforms.Resize(36, antialias=True),
+            transforms.FiveCrop(28),
+            Lambda(torch.stack),
+        ],
+    )
     dataclass = MNISTDataModule
-    extra_transforms = [
-        transforms.Resize(36, antialias=True),
-        transforms.FiveCrop(28),
-        Lambda(torch.stack),
-    ]
+elif args.dataset == "imagenet":
+    image_size = ((224, 224),)
+    patch_size = ((16, 16),)
+    image_channels = (3,)
+    output_dim = (1000,)
+    kwargs = dict(
+        crop_transform=transforms.CenterCrop(224),
+    )
+    dataclass = ImagenetH5DataModule
+
 else:
     raise ValueError("Invalid dataset")
 
@@ -83,8 +97,8 @@ datamodule = dataclass(
     num_workers=min(os.cpu_count(), 8),
     root_dir=args.data_dir,
     pin_memory=True,
-    nshot=args.nshot if args.nshot > 0 else None,
-    extra_transforms=extra_transforms,
+    nshot=args.nshot if args.nshot > 0 and args.dataset != "imagenet" else None,
+    **kwargs,
 )
 
 if args.model == "vit":

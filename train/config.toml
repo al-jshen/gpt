@@ -1,5 +1,5 @@
 [config]
-dataset = "cifar10" # [cifar10, mnist]
+dataset = "cifar10" # [cifar10, mnist, imagenet]
 model = "vit" # [vit]
 batch_size = 128
 precision = "bf16-mixed" # [16-mixed, bf16-mixed, 32-true]
