@@ -1,9 +1,24 @@
+import h5py
+import numpy as np
+import os
 import torch
 import torchvision
-import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms
+from torch.utils.data import Dataset
 import lightning.pytorch as pl
 from collections import Counter
 from torch.utils.data import Subset
+from functools import cached_property
+from einops import rearrange
+from .imagenet_classes import IMAGENET_CLASSES
+
+
+to_tensor = transforms.Compose(
+    [
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+    ]
+)
 
 
 class DataModule(pl.LightningDataModule):
@@ -123,7 +138,7 @@ class CIFAR10DataModule(DataModule):
 
         self.transform = transforms.Compose(
             [
-                transforms.ToTensor(),
+                to_tensor,
                 transforms.Normalize(
                     mean=self.normalization_means,
                     std=self.normalization_stds,
@@ -199,7 +214,7 @@ class MNISTDataModule(DataModule):
 
         self.transform = transforms.Compose(
             [
-                transforms.ToTensor(),
+                to_tensor,
                 transforms.Normalize(self.normalization_means, self.normalization_stds),
                 *extra_transforms,
             ]
@@ -234,6 +249,118 @@ class MNISTDataModule(DataModule):
                 train=False,
                 download=False,
                 transform=self.transform,
+            )
+
+
+class HDF5Dataset(Dataset):
+    def __init__(self, path: str, x_key: str, y_key: str, transform=None):
+        self.path = path
+        self.transform = transform
+        self.data = None
+        self.x_key = x_key
+        self.y_key = y_key
+        self.file = None  #
+
+        with h5py.File(self.path, "r") as f:
+            assert x_key in f.keys(), f"x_key {x_key} not in hdf5 file keys"
+            assert y_key in f.keys(), f"y_key {y_key} not in hdf5 file keys"
+            self.len = f[self.x_key].shape[0]
+
+    def open(self):
+        self.file = h5py.File(self.path, "r")
+
+    def __len__(self):
+        return self.len
+
+    @cached_property
+    def targets(self):
+        return np.unique(self.file[self.y_key][:])
+
+    def __del__(self):
+        if self.file is not None:
+            self.file.close()
+            # self.file = None
+
+    def __getitem__(self, idx):
+        if self.file is None:
+            self.open()
+        x = self.file[self.x_key][idx]
+        y = self.file[self.y_key][idx]
+        if self.transform:
+            x = self.transform(x)
+        return x, y
+
+
+class ImagenetH5DataModule(DataModule):
+    def __init__(
+        self,
+        crop_transform,
+        batch_size=64,
+        num_workers=8,
+        pin_memory=True,
+        collate_fn=None,
+        root_dir="/scratch/gpfs/js5013/data/ml/",
+        extra_transforms=[],
+        nshot=None,
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            root_dir=root_dir,
+            collate_fn=collate_fn,
+            nshot=nshot,
+        )
+        self.normalization_means = torch.tensor([0.485, 0.456, 0.406])
+        self.normalization_stds = torch.tensor([0.229, 0.224, 0.225])
+
+        self.transform_train = transforms.Compose(
+            [
+                transforms.Lambda(lambda x: rearrange(x, "c h w -> h w c")),
+                to_tensor,
+                crop_transform,
+                transforms.Normalize(self.normalization_means, self.normalization_stds),
+                *extra_transforms,
+            ]
+        )
+
+        self.transform_test = transforms.Compose(
+            [
+                transforms.Lambda(lambda x: rearrange(x, "c h w -> h w c")),
+                to_tensor,
+                transforms.Normalize(self.normalization_means, self.normalization_stds),
+                *extra_transforms,
+            ]
+        )
+
+    @property
+    def classes(self):
+        return IMAGENET_CLASSES
+
+    def unnormalize(self, x):
+        inv_normalization = transforms.Normalize(
+            mean=-self.normalization_means / self.normalization_stds,
+            std=1 / self.normalization_stds,
+        )
+
+        return inv_normalization(x)
+
+    def prepare_data(self):
+        pass
+
+    def _setup(self, stage=None):
+        if stage == "fit" or stage is None:
+            self.trainset = HDF5Dataset(
+                path=os.path.join(self.root_dir, "imagenet", "imagenet_train.hdf5"),
+                x_key="images",
+                y_key="labels",
+                transform=self.transform_train,
+            )
+            self.testset = HDF5Dataset(
+                path=os.path.join(self.root_dir, "imagenet", "imagenet_val.hdf5"),
+                x_key="images",
+                y_key="labels",
+                transform=self.transform_test,
             )
 
 
