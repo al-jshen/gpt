@@ -272,10 +272,6 @@ class HDF5Dataset(Dataset):
     def __len__(self):
         return self.len
 
-    @cached_property
-    def targets(self):
-        return np.unique(self.file[self.y_key][:])
-
     def __del__(self):
         if self.file is not None:
             self.file.close()
@@ -301,7 +297,6 @@ class ImagenetH5DataModule(DataModule):
         collate_fn=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
-        nshot=None,
     ):
         super().__init__(
             batch_size=batch_size,
@@ -309,7 +304,7 @@ class ImagenetH5DataModule(DataModule):
             pin_memory=pin_memory,
             root_dir=root_dir,
             collate_fn=collate_fn,
-            nshot=nshot,
+            nshot=None,
         )
         self.normalization_means = torch.tensor([0.485, 0.456, 0.406])
         self.normalization_stds = torch.tensor([0.229, 0.224, 0.225])
@@ -335,7 +330,7 @@ class ImagenetH5DataModule(DataModule):
 
     @property
     def classes(self):
-        return IMAGENET_CLASSES
+        return list(IMAGENET_CLASSES.items())
 
     def unnormalize(self, x):
         inv_normalization = transforms.Normalize(
