@@ -6,6 +6,94 @@ import torch.nn.functional as F
 from functorch.einops import rearrange
 from einops.layers.torch import Rearrange
 from einops import repeat
+from functools import cached_property
+import math
+
+
+class ReAttention(nn.Module):
+    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1):
+        super().__init__()
+
+        assert (
+            embed_dim % num_heads == 0
+        ), "Embedding dimension must be divisible by number of heads"
+
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.dropout = dropout
+
+        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.proj = nn.Linear(embed_dim, embed_dim)
+        self.proj_dropout = nn.Dropout(dropout)
+
+        # reattention
+        self.reattn_weight = nn.Parameter(torch.randn(num_heads, num_heads))
+        self.reattn_norm = nn.Sequential(
+            Rearrange("b h i j -> b i j h"),
+            nn.LayerNorm(num_heads),
+            Rearrange("b i j h -> b h i j"),
+        )
+
+    def scaled_dot_product_reattention(
+        self,
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+    ):
+        L, S = query.size(-2), key.size(-2)
+        scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+        attn_bias = torch.zeros(L, S, dtype=query.dtype)
+
+        if is_causal:
+            assert attn_mask is None
+            temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias.to(query.dtype)
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                attn_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
+            else:
+                attn_bias = attn_bias + attn_mask
+
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+        attn_weight = attn_weight + attn_bias
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+
+        attn_weight = torch.einsum(
+            "b h i j, h g -> b g i j", attn_weight, self.reattn_weight
+        )
+        attn_weight = self.reattn_norm(attn_weight)
+
+        return attn_weight @ value
+
+    def forward(self, x):
+        # B, T, C = x.shape  # c = embed_dim, T = sequences (patches)
+        H = self.num_heads
+
+        # Self-attention
+        qkv = self.to_qkv(x).chunk(3, dim=-1)  # b t c -> b t 3c -> 3 b t c
+        q, k, v = map(
+            lambda t: rearrange(t, "b t (h d) -> b h t d", h=H), qkv
+        )  # where channels C = dims D * heads H
+
+        y = self.scaled_dot_product_reattention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0
+        )
+
+        # Project back to embedding dimension
+        y = rearrange(y, "b h t d -> b t (h d)")
+
+        # output projection
+        y = self.proj(y)
+        y = self.proj_dropout(y)
+
+        return y
 
 
 class Attention(nn.Module):
@@ -25,7 +113,7 @@ class Attention(nn.Module):
         self.proj_dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        B, T, C = x.shape  # c = embed_dim, T = sequences (patches)
+        # B, T, C = x.shape  # c = embed_dim, T = sequences (patches)
         H = self.num_heads
 
         # Self-attention
@@ -123,27 +211,33 @@ class TransformerBlock(nn.Module):
         self,
         num_heads=12,
         embed_dim=768,
-        mlp_dim=768 * 4,
+        mlp_ratio=4,
         dropout=0.1,
         parallel_paths=2,
+        layer_scale=1e-2,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
         # self.ln = nn.LayerNorm(embed_dim)
+        self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale)
+        self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale)
         self.attns = Parallel(
             [
-                Attention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
+                ReAttention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
                 for _ in range(parallel_paths)
             ]
         )
         self.mlps = Parallel(
-            [MLP(embed_dim, mlp_dim, dropout=dropout) for _ in range(parallel_paths)]
+            [
+                MLP(embed_dim, embed_dim * mlp_ratio, dropout=dropout)
+                for _ in range(parallel_paths)
+            ]
         )
 
     def forward(self, x):
-        x = x + self.attns(self.ln1(x))
-        x = x + self.mlps(self.ln2(x))
+        x = x + self.ls1 * self.attns(self.ln1(x))
+        x = x + self.ls2 * self.mlps(self.ln2(x))
         return x
 
 
@@ -173,7 +267,7 @@ class ViT(nn.Module):
     def __init__(
         self,
         embed_dim=768,
-        mlp_dim=768 * 4,
+        mlp_ratio=4,
         num_heads=12,
         dropout=0.1,
         num_blocks=6,
@@ -185,7 +279,7 @@ class ViT(nn.Module):
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        self.mlp_dim = mlp_dim
+        self.mlp_ratio = mlp_ratio
         self.num_heads = num_heads
         self.num_blocks = num_blocks
         self.parallel_paths = parallel_paths
@@ -228,24 +322,24 @@ class ViT(nn.Module):
 
         self.blocks = nn.Sequential(
             *[
-                TransformerBlock(num_heads, embed_dim, mlp_dim, dropout, parallel_paths)
-                for _ in range(num_blocks)
+                TransformerBlock(
+                    num_heads,
+                    embed_dim,
+                    mlp_ratio,
+                    dropout,
+                    parallel_paths,
+                    layer_scale=0.1 if i < 9 else 1e-5 if i < 12 else 1e-6,
+                )
+                for i in range(num_blocks)
             ]
         )  # transformer blocks
 
         self.norm = nn.LayerNorm(embed_dim)
 
-        # # output head here ...
-        if output_head is None:
-            self.output_head = DebedHead(
-                embed_dim, image_channels, image_size, patch_size
-            )
-
-        else:
-            self.output_head = output_head
+        self.output_head = output_head
 
     def forward(self, x):
-        B, C, H, W = x.shape
+        # B, C, H, W = x.shape
 
         # split into patches
         x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
@@ -262,11 +356,12 @@ class ViT(nn.Module):
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
 
-        x = self.output_head(x)
+        if self.output_head is not None:
+            x = self.output_head(x)
 
         return x
 
-    @property
+    @cached_property
     def nparams(self):
         return sum([p.numel() for p in self.parameters()])
 

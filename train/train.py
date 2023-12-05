@@ -17,7 +17,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import lightning.pytorch as pl
-from gpt.model import ViT, LightningWrapper, ClassificationHead, LightningMAE, Lambda
+from gpt.model import (
+    DebedHead,
+    ViT,
+    LightningWrapper,
+    ClassificationHead,
+    LightningMAE,
+    Lambda,
+)
 from gpt.data import CIFAR10DataModule, MNISTDataModule, ImagenetH5DataModule
 
 torch.set_float32_matmul_precision("medium")
@@ -30,6 +37,7 @@ if args.task == "classification":
         return x.view(-1, *x.shape[2:]), torch.tensor(y).unsqueeze(-1).repeat(
             1, x.shape[1]
         ).view(-1)
+
 elif args.task == "reconstruction":
 
     def collate(lop):
@@ -51,39 +59,45 @@ else:
 
 
 if args.dataset == "cifar10":
-    image_size = ((32, 32),)
-    patch_size = ((4, 4),)
-    image_channels = (3,)
-    output_dim = (10,)
+    image_size = (32, 32)
+    patch_size = (4, 4)
+    image_channels = 3
+    output_dim = 10
     kwargs = dict(
         extra_transforms=[
             transforms.Resize(40, antialias=True),
             transforms.FiveCrop(32),
             Lambda(torch.stack),
         ],
+        nshot=args.nshot if args.nshot > 0 else None,
     )
     dataclass = CIFAR10DataModule
 
 elif args.dataset == "mnist":
-    image_size = ((28, 28),)
-    patch_size = ((4, 4),)
-    image_channels = (1,)
-    output_dim = (10,)
+    image_size = (28, 28)
+    patch_size = (4, 4)
+    image_channels = 1
+    output_dim = 10
     kwargs = dict(
         extra_transforms=[
             transforms.Resize(36, antialias=True),
             transforms.FiveCrop(28),
             Lambda(torch.stack),
         ],
+        nshot=args.nshot if args.nshot > 0 else None,
     )
     dataclass = MNISTDataModule
 elif args.dataset == "imagenet":
-    image_size = ((224, 224),)
-    patch_size = ((16, 16),)
-    image_channels = (3,)
-    output_dim = (1000,)
+    image_size = (224, 224)
+    patch_size = (16, 16)
+    image_channels = 3
+    output_dim = 1000
     kwargs = dict(
-        crop_transform=transforms.CenterCrop(224),
+        crop_transform=Lambda(lambda x: x),
+        extra_transforms=[
+            transforms.FiveCrop(224),
+            Lambda(torch.stack),
+        ],
     )
     dataclass = ImagenetH5DataModule
 
@@ -97,7 +111,6 @@ datamodule = dataclass(
     num_workers=min(os.cpu_count(), 8),
     root_dir=args.data_dir,
     pin_memory=True,
-    nshot=args.nshot if args.nshot > 0 and args.dataset != "imagenet" else None,
     **kwargs,
 )
 
@@ -107,15 +120,17 @@ if args.model == "vit":
         image_size=image_size,
         patch_size=patch_size,
         image_channels=image_channels,
-        embed_dim=512,
-        mlp_dim=1024,
-        num_heads=16,
-        num_blocks=3,
+        embed_dim=args.embed_dim,
+        mlp_ratio=args.mlp_ratio,
+        num_heads=args.num_heads,
+        num_blocks=args.num_blocks,
         parallel_paths=2,
         dropout=0.1,
-        lr=1e-3,
-        output_head=ClassificationHead(512, output_dim)
+        lr=2e-3,
+        output_head=ClassificationHead(args.embed_dim, output_dim)
         if args.task == "classification"
+        else DebedHead(args.embed_dim, image_channels, image_size, patch_size)
+        if args.task == "reconstruction"
         else None,
         loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,
     )
@@ -129,11 +144,11 @@ if args.task == "mae":
         LightningMAE,
         vit=model.model,
         masking_fraction=args.masking_fraction,
-        decoder_num_blocks=1,
+        decoder_num_blocks=args.decoder_num_blocks,
         logging=True,
         inner_logging=False,
         loss_fn=F.mse_loss,
-        lr=1e-3,
+        lr=2e-3,
     )
 
 if args.compile:
