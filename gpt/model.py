@@ -176,7 +176,7 @@ class hMLP_stem(nn.Module):
 
     def forward(self, x):
         # b c h w
-        if x.ndim == 4:
+        if self.spatial_dims == 2:
             return self.in_proj(x.unsqueeze(-1)).squeeze(-1)
         # b c h w d
         return self.in_proj(x)
@@ -187,11 +187,10 @@ class hMLP_output(nn.Module):
 
     def __init__(
         self,
-        patch_size=(16, 16, 16),
-        out_chans=3,
         embed_dim=768,
+        out_chans=3,
+        patch_size=(16, 16, 16),
         spatial_dims=3,
-        norm_groups=12,
     ):
         super().__init__()
         assert (
@@ -210,7 +209,7 @@ class hMLP_output(nn.Module):
                     stride=self.kernel_sizes[0],
                     bias=False,
                 ),
-                RMSGroupNorm(norm_groups, embed_dim // 4, affine=True),
+                nn.InstanceNorm3d(embed_dim // 4, affine=True),
                 nn.GELU(),
                 nn.ConvTranspose3d(
                     embed_dim // 4,
@@ -219,28 +218,21 @@ class hMLP_output(nn.Module):
                     stride=self.kernel_sizes[1],
                     bias=False,
                 ),
-                RMSGroupNorm(norm_groups, embed_dim // 4, affine=True),
+                nn.InstanceNorm3d(embed_dim // 4, affine=True),
                 nn.GELU(),
+                nn.ConvTranspose3d(
+                    embed_dim // 4,
+                    out_chans,
+                    kernel_size=self.kernel_sizes[2],
+                    stride=self.kernel_sizes[2],
+                ),
             ]
         )
-        out_head = nn.ConvTranspose3d(
-            embed_dim // 4,
-            out_chans,
-            kernel_size=self.kernel_sizes[2],
-            stride=self.kernel_sizes[2],
-        )
-        self.out_kernel = nn.Parameter(out_head.weight)
-        self.out_bias = nn.Parameter(out_head.bias)
 
-    def forward(self, x, state_labels):
-        x = self.out_proj(x)
-        x = F.conv_transpose3d(
-            x,
-            self.out_kernel[:, state_labels],
-            self.out_bias[state_labels],
-            stride=self.kernel_sizes[2],
-        )
-        return x
+    def forward(self, x):
+        if self.spatial_dims == 2:
+            return self.out_proj(x.unsqueeze(-1)).squeeze(-1)
+        return self.out_proj(x)
 
 
 class MLP(nn.Module):
@@ -281,26 +273,35 @@ class DebedHead(nn.Module):
     def __init__(self, in_channels, out_channels, image_size, patch_size):
         super().__init__()
         assert len(image_size) == len(patch_size)
-        spatial_dims = len(image_size)
-        assert spatial_dims <= 3, "spatial dims must be 1, 2, or 3"
-        n_patches = [image_size[d] // patch_size[d] for d in range(spatial_dims)]
+        self.spatial_dims = len(image_size)
+        assert self.spatial_dims <= 3, "spatial dims must be 1, 2, or 3"
+        self.num_patches = tuple(
+            [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
+        )
 
-        self.debed = nn.Sequential(
-            Rearrange(
-                "b (nh nw) c -> b c nh nw",
-                nh=n_patches[0],
-                nw=n_patches[1],
-            ),
-            nn.ConvTranspose2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=patch_size,
-                stride=patch_size,
-            ),
+        # self.debed = nn.ConvTranspose2d(
+        #     in_channels=in_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=patch_size,
+        #     stride=patch_size,
+        # )
+
+        self.debed = hMLP_output(
+            embed_dim=in_channels,
+            out_chans=out_channels,
+            patch_size=patch_size,
+            spatial_dims=self.spatial_dims,
         )
 
     def forward(self, x):
-        return self.debed(x)
+        x = rearrange(
+            x,
+            "b (nh nw) c -> b c nh nw",
+            nh=self.num_patches[0],
+            nw=self.num_patches[1],
+        )  # (b, embed_dim, nh, nw)
+        x = self.debed(x)
+        return x
 
 
 class Parallel(nn.Module):
@@ -386,7 +387,7 @@ class ViT(nn.Module):
             [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
         )
 
-        patch_dim = np.prod(patch_size) * image_channels
+        # patch_dim = np.prod(patch_size) * image_channels
 
         # self.to_patch = Rearrange(
         #     "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
