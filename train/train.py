@@ -25,7 +25,13 @@ from gpt.model import (
     LightningMAE,
     Lambda,
 )
-from gpt.data import CIFAR10DataModule, MNISTDataModule, ImagenetH5DataModule
+from gpt.data import (
+    CIFAR10DataModule,
+    MNISTDataModule,
+    ImagenetH5DataModule,
+    Galaxy10DataModule,
+    Galaxy10DECalsDataModule,
+)
 
 torch.set_float32_matmul_precision("medium")
 
@@ -36,7 +42,7 @@ if args.task == "classification":
         x = torch.stack(x)
         return x.view(-1, *x.shape[2:]), torch.tensor(y).unsqueeze(-1).repeat(
             1, x.shape[1]
-        ).view(-1)
+        ).view(-1).long()
 
 elif args.task == "reconstruction":
 
@@ -66,12 +72,40 @@ if args.dataset == "cifar10":
     kwargs = dict(
         extra_transforms=[
             transforms.Resize(40, antialias=True),
-            transforms.FiveCrop(32),
+            transforms.TenCrop(32),
             Lambda(torch.stack),
         ],
         nshot=args.nshot if args.nshot > 0 else None,
     )
     dataclass = CIFAR10DataModule
+
+elif args.dataset == "galaxy10":
+    image_size = (64, 64)
+    patch_size = (4, 4)
+    image_channels = 3
+    output_dim = 10
+    kwargs = dict(
+        extra_transforms=[
+            transforms.TenCrop(64),
+            Lambda(torch.stack),
+        ],
+        nshot=args.nshot if args.nshot > 0 else None,
+    )
+    dataclass = Galaxy10DataModule
+
+elif args.dataset == "galaxy10decals":
+    image_size = (224, 224)
+    patch_size = (16, 16)
+    image_channels = 3
+    output_dim = 10
+    kwargs = dict(
+        extra_transforms=[
+            transforms.TenCrop(224),
+            Lambda(torch.stack),
+        ],
+        nshot=args.nshot if args.nshot > 0 else None,
+    )
+    dataclass = Galaxy10DECalsDataModule
 
 elif args.dataset == "mnist":
     image_size = (28, 28)
@@ -87,15 +121,15 @@ elif args.dataset == "mnist":
         nshot=args.nshot if args.nshot > 0 else None,
     )
     dataclass = MNISTDataModule
+
 elif args.dataset == "imagenet":
     image_size = (224, 224)
     patch_size = (16, 16)
     image_channels = 3
     output_dim = 1000
     kwargs = dict(
-        crop_transform=Lambda(lambda x: x),
         extra_transforms=[
-            transforms.FiveCrop(224),
+            transforms.TenCrop(224),
             Lambda(torch.stack),
         ],
     )
@@ -124,6 +158,7 @@ if args.model == "vit":
         mlp_ratio=args.mlp_ratio,
         num_heads=args.num_heads,
         num_blocks=args.num_blocks,
+        reattention=args.reattention,
         parallel_paths=2,
         dropout=0.1,
         lr=2e-3,
@@ -167,7 +202,7 @@ else:
         devices=args.gpus,
         strategy=args.strategy,
         precision=args.precision,
-        gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
+        # gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
         max_epochs=args.epochs,
         enable_model_summary=True,
         enable_progress_bar=True,
