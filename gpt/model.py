@@ -51,8 +51,8 @@ class Attention(nn.Module):
         scale=None,
     ):
         if self.v_ones is None:
-            B, T, *_ = query.shape
-            self.v_ones = torch.ones((T, T)).expand(B, T, T)
+            B, H, N, C = query.shape
+            self.v_ones = torch.ones((N, N)).expand(B, H, N, N)
 
         attn_weight = F.scaled_dot_product_attention(
             query,
@@ -72,13 +72,13 @@ class Attention(nn.Module):
         return attn_weight @ value
 
     def forward(self, x):
-        # B, T, C = x.shape  # c = embed_dim, T = sequences (patches)
+        # B, N, C = x.shape  # c = embed_dim, N = sequences (patches)
         H = self.num_heads
 
         # Self-attention
-        qkv = self.to_qkv(x).chunk(3, dim=-1)  # b t c -> b t 3c -> 3 b t c
+        qkv = self.to_qkv(x).chunk(3, dim=-1)  # b n c -> b n 3c -> 3 b n c
         q, k, v = map(
-            lambda x: rearrange(x, "b t (he d) -> b he t d", he=H), qkv
+            lambda x: rearrange(x, "b n (he d) -> b he n d", he=H), qkv
         )  # where channels C = dims D * heads H
 
         q = self.qnorm(q)
