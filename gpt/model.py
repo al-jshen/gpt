@@ -55,7 +55,13 @@ class Attention(nn.Module):
             self.v_ones = torch.ones((T, T)).expand(B, T, T)
 
         attn_weight = F.scaled_dot_product_attention(
-            query, key, self.v_ones, attn_mask, dropout_p, is_causal, scale
+            query,
+            key,
+            self.v_ones,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
         )
 
         attn_weight = torch.einsum(
@@ -97,6 +103,144 @@ class Attention(nn.Module):
         y = self.proj_dropout(y)
 
         return y
+
+
+_kernel_sizes = {
+    1: (1, 1, 1),
+    2: (2, 1, 1),
+    4: (2, 2, 1),
+    8: (2, 2, 2),
+    16: (4, 2, 2),
+    32: (4, 4, 2),
+    64: (4, 4, 4),
+}
+
+
+def build_kernel_size(patch_size):
+    patch_size = tuple(patch_size)
+    # back pad with 1 until length 3
+    patch_size = patch_size + (1,) * (3 - len(patch_size))
+    return list(zip(*[_kernel_sizes[s] for s in patch_size]))
+
+
+class hMLP_stem(nn.Module):
+    """Image to Patch Embedding"""
+
+    def __init__(
+        self,
+        patch_size=(16, 16, 16),
+        in_chans=3,
+        embed_dim=768,
+        spatial_dims=3,
+    ):
+        super().__init__()
+        assert (
+            len(patch_size) == spatial_dims
+        ), "Must have one patch size for each spatial dimension"
+        self.kernel_sizes = build_kernel_size(patch_size)
+        self.patch_size = patch_size
+        self.spatial_dims = spatial_dims
+        self.in_proj = torch.nn.Sequential(
+            *[
+                nn.Conv3d(
+                    in_chans,
+                    embed_dim // 4,
+                    kernel_size=self.kernel_sizes[0],
+                    stride=self.kernel_sizes[0],
+                    bias=False,
+                    padding=0,
+                ),
+                nn.InstanceNorm3d(embed_dim // 4, affine=True),
+                nn.GELU(),
+                nn.Conv3d(
+                    embed_dim // 4,
+                    embed_dim // 4,
+                    kernel_size=self.kernel_sizes[1],
+                    stride=self.kernel_sizes[1],
+                    bias=False,
+                    padding=0,
+                ),
+                nn.InstanceNorm3d(embed_dim // 4, affine=True),
+                nn.GELU(),
+                nn.Conv3d(
+                    embed_dim // 4,
+                    embed_dim,
+                    kernel_size=self.kernel_sizes[2],
+                    stride=self.kernel_sizes[2],
+                    bias=False,
+                    padding=0,
+                ),
+                nn.InstanceNorm3d(embed_dim, affine=True),
+            ]
+        )
+
+    def forward(self, x):
+        # b c h w
+        if x.ndim == 4:
+            return self.in_proj(x.unsqueeze(-1)).squeeze(-1)
+        # b c h w d
+        return self.in_proj(x)
+
+
+class hMLP_output(nn.Module):
+    """Patch to Image Debedding"""
+
+    def __init__(
+        self,
+        patch_size=(16, 16, 16),
+        out_chans=3,
+        embed_dim=768,
+        spatial_dims=3,
+        norm_groups=12,
+    ):
+        super().__init__()
+        assert (
+            len(patch_size) == spatial_dims
+        ), "Must have one patch size for each spatial dimension"
+        self.kernel_sizes = build_kernel_size(patch_size)
+        self.patch_size = patch_size
+        self.spatial_dims = spatial_dims
+
+        self.out_proj = torch.nn.Sequential(
+            *[
+                nn.ConvTranspose3d(
+                    embed_dim,
+                    embed_dim // 4,
+                    kernel_size=self.kernel_sizes[0],
+                    stride=self.kernel_sizes[0],
+                    bias=False,
+                ),
+                RMSGroupNorm(norm_groups, embed_dim // 4, affine=True),
+                nn.GELU(),
+                nn.ConvTranspose3d(
+                    embed_dim // 4,
+                    embed_dim // 4,
+                    kernel_size=self.kernel_sizes[1],
+                    stride=self.kernel_sizes[1],
+                    bias=False,
+                ),
+                RMSGroupNorm(norm_groups, embed_dim // 4, affine=True),
+                nn.GELU(),
+            ]
+        )
+        out_head = nn.ConvTranspose3d(
+            embed_dim // 4,
+            out_chans,
+            kernel_size=self.kernel_sizes[2],
+            stride=self.kernel_sizes[2],
+        )
+        self.out_kernel = nn.Parameter(out_head.weight)
+        self.out_bias = nn.Parameter(out_head.bias)
+
+    def forward(self, x, state_labels):
+        x = self.out_proj(x)
+        x = F.conv_transpose3d(
+            x,
+            self.out_kernel[:, state_labels],
+            self.out_bias[state_labels],
+            stride=self.kernel_sizes[2],
+        )
+        return x
 
 
 class MLP(nn.Module):
@@ -244,18 +388,25 @@ class ViT(nn.Module):
 
         patch_dim = np.prod(patch_size) * image_channels
 
-        self.to_patch = Rearrange(
-            "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
-            p1=patch_size[0],
-            p2=patch_size[1],
-            nh=self.n_patches[0],
-            nw=self.n_patches[1],
-        )
+        # self.to_patch = Rearrange(
+        #     "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
+        #     p1=patch_size[0],
+        #     p2=patch_size[1],
+        #     nh=self.n_patches[0],
+        #     nw=self.n_patches[1],
+        # )
 
-        self.patch_embed = nn.Sequential(
-            nn.LayerNorm(patch_dim),
-            nn.Linear(patch_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
+        # self.patch_embed = nn.Sequential(
+        #     nn.LayerNorm(patch_dim),
+        #     nn.Linear(patch_dim, embed_dim),
+        #     nn.LayerNorm(embed_dim),
+        # )
+
+        self.patch_embed = hMLP_stem(
+            patch_size=patch_size,
+            in_chans=image_channels,
+            embed_dim=embed_dim,
+            spatial_dims=self.spatial_dims,
         )
 
         self.positional_encoding = nn.Parameter(
@@ -288,11 +439,13 @@ class ViT(nn.Module):
     def forward(self, x):
         # B, C, H, W = x.shape
 
-        # split into patches
-        x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
+        # # split into patches
+        # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
 
         # embed patches
-        x = self.patch_embed(x)  # (b, n_patches, embed_dim)
+        x = self.patch_embed(x)  # (b, embed_dim, nh, nw)
+
+        x = rearrange(x, "b c h w -> b (h w) c")  # (b, n_patches, embed_dim)
 
         # add positional encoding and do dropout
         x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
@@ -437,9 +590,11 @@ class MAE(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
 
-        patches = self.vit.to_patch(x)  # (b n_patches patch_dim)
+        # patches = self.vit.to_patch(x)  # (b n_patches patch_dim)
 
-        tokens = self.vit.patch_embed(patches)  # (b n_patches embed_dim)
+        tokens = self.vit.patch_embed(x)  # (b embed_dim, nh, nw)
+
+        tokens = rearrange(tokens, "b c h w -> b (h w) c")  # (b n_patches embed_dim)
 
         n_patches = tokens.shape[1]
 
