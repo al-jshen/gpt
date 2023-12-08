@@ -7,11 +7,12 @@ from functorch.einops import rearrange
 from einops.layers.torch import Rearrange
 from einops import repeat
 from functools import cached_property
-import math
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+from lightning.pytorch.strategies import DeepSpeedStrategy
 
 
-class ReAttention(nn.Module):
-    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1):
+class Attention(nn.Module):
+    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1, reattention=False):
         super().__init__()
 
         assert (
@@ -26,13 +27,18 @@ class ReAttention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
-        # reattention
-        self.reattn_weight = nn.Parameter(torch.randn(num_heads, num_heads))
-        self.reattn_norm = nn.Sequential(
-            Rearrange("b h i j -> b i j h"),
-            nn.LayerNorm(num_heads),
-            Rearrange("b i j h -> b h i j"),
-        )
+        self.qnorm = nn.LayerNorm(embed_dim // num_heads)
+        self.knorm = nn.LayerNorm(embed_dim // num_heads)
+
+        self.reattention = reattention
+        if reattention:
+            self.reattn_weight = nn.Parameter(torch.randn(num_heads, num_heads))
+            self.reattn_norm = nn.Sequential(
+                Rearrange("b h i j -> b i j h"),
+                nn.LayerNorm(num_heads),
+                Rearrange("b i j h -> b h i j"),
+            )
+            self.v_ones = None
 
     def scaled_dot_product_reattention(
         self,
@@ -44,26 +50,13 @@ class ReAttention(nn.Module):
         is_causal=False,
         scale=None,
     ):
-        L, S = query.size(-2), key.size(-2)
-        scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-        attn_bias = torch.zeros(L, S, dtype=query.dtype)
+        if self.v_ones is None:
+            B, T, *_ = query.shape
+            self.v_ones = torch.ones((T, T)).expand(B, T, T)
 
-        if is_causal:
-            assert attn_mask is None
-            temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-            attn_bias.to(query.dtype)
-
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                attn_mask.masked_fill_(attn_mask.logical_not(), float("-inf"))
-            else:
-                attn_bias = attn_bias + attn_mask
-
-        attn_weight = query @ key.transpose(-2, -1) * scale_factor
-        attn_weight = attn_weight + attn_bias
-        attn_weight = torch.softmax(attn_weight, dim=-1)
-        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+        attn_weight = F.scaled_dot_product_attention(
+            query, key, self.v_ones, attn_mask, dropout_p, is_causal, scale
+        )
 
         attn_weight = torch.einsum(
             "b h i j, h g -> b g i j", attn_weight, self.reattn_weight
@@ -79,53 +72,22 @@ class ReAttention(nn.Module):
         # Self-attention
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # b t c -> b t 3c -> 3 b t c
         q, k, v = map(
-            lambda t: rearrange(t, "b t (h d) -> b h t d", h=H), qkv
+            lambda x: rearrange(x, "b t (he d) -> b he t d", he=H), qkv
         )  # where channels C = dims D * heads H
 
-        y = self.scaled_dot_product_reattention(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0
-        )
-
-        # Project back to embedding dimension
-        y = rearrange(y, "b h t d -> b t (h d)")
-
-        # output projection
-        y = self.proj(y)
-        y = self.proj_dropout(y)
-
-        return y
-
-
-class Attention(nn.Module):
-    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1):
-        super().__init__()
-
-        assert (
-            embed_dim % num_heads == 0
-        ), "Embedding dimension must be divisible by number of heads"
-
-        self.num_heads = num_heads
-        self.embed_dim = embed_dim
-        self.dropout = dropout
-
-        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3)
-        self.proj = nn.Linear(embed_dim, embed_dim)
-        self.proj_dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # B, T, C = x.shape  # c = embed_dim, T = sequences (patches)
-        H = self.num_heads
-
-        # Self-attention
-        qkv = self.to_qkv(x).chunk(3, dim=-1)  # b t c -> b t 3c -> 3 b t c
-        q, k, v = map(
-            lambda t: rearrange(t, "b t (h d) -> b h t d", h=H), qkv
-        )  # where channels C = dims D * heads H
+        q = self.qnorm(q)
+        k = self.knorm(k)
 
         # Scale dot product attention, attend over T dim (2nd last)
-        y = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0
-        )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
+        if self.reattention:
+            y = self.scaled_dot_product_reattention(
+                q, k, v, dropout_p=self.dropout if self.training else 0.0
+            )
+
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.dropout if self.training else 0.0
+            )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
 
         # Project back to embedding dimension
         y = rearrange(y, "b h t d -> b t (h d)")
@@ -215,16 +177,21 @@ class TransformerBlock(nn.Module):
         dropout=0.1,
         parallel_paths=2,
         layer_scale=1e-2,
+        reattention=True,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
-        # self.ln = nn.LayerNorm(embed_dim)
         self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale)
         self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale)
         self.attns = Parallel(
             [
-                ReAttention(num_heads=num_heads, embed_dim=embed_dim, dropout=dropout)
+                Attention(
+                    num_heads=num_heads,
+                    embed_dim=embed_dim,
+                    dropout=dropout,
+                    reattention=reattention,
+                )
                 for _ in range(parallel_paths)
             ]
         )
@@ -241,28 +208,6 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class InstanceNormXd(nn.Module):
-    def __init__(self, dim, eps=1e-7):
-        super().__init__()
-        self.eps = eps
-        self.dim = dim
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.bias = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x):
-        # n c n1, ..., nd
-        n_spatial_dims = len(x.shape) - 2
-        assert n_spatial_dims >= 1
-        std_dims = tuple(range(2, n_spatial_dims + 2))
-        std = torch.std(x, dim=std_dims, unmaskdim=True)
-        x = (x) / (std + self.eps)
-        x = (
-            x * self.weight[None, :, *(None,) * n_spatial_dims]
-            + self.bias[None, :, *(None,) * n_spatial_dims]
-        )
-        return x
-
-
 class ViT(nn.Module):
     def __init__(
         self,
@@ -275,6 +220,7 @@ class ViT(nn.Module):
         image_channels=3,
         image_size=(256, 256),
         patch_size=(16, 16),
+        reattention=True,
         output_head=None,
     ):
         super().__init__()
@@ -329,6 +275,7 @@ class ViT(nn.Module):
                     dropout,
                     parallel_paths,
                     layer_scale=0.1 if i < 9 else 1e-5 if i < 12 else 1e-6,
+                    reattention=reattention,
                 )
                 for i in range(num_blocks)
             ]
@@ -429,8 +376,22 @@ class LightningMAE(pl.LightningModule):
         self._log("test_loss", loss)
         return loss
 
+    @property
+    def deepspeed_offload(self) -> bool:
+        strategy = self.trainer.strategy
+        if isinstance(strategy, DeepSpeedStrategy):
+            cfg = strategy.config["zero_optimization"]
+            return cfg.get("offload_optimizer") or cfg.get("offload_param")
+        return False
+
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        if self.deepspeed_offload:
+            return DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            fused=True,
+        )
 
 
 class MAE(nn.Module):
@@ -458,7 +419,13 @@ class MAE(nn.Module):
         self.decoder = nn.Sequential(
             *[
                 TransformerBlock(
-                    decoder_num_heads, decoder_dim, decoder_dim * 4, decoder_dropout
+                    num_heads=decoder_num_heads,
+                    embed_dim=decoder_dim,
+                    mlp_ratio=4,
+                    dropout=decoder_dropout,
+                    parallel_paths=2,
+                    layer_scale=0.1,
+                    reattention=True,
                 )
                 for _ in range(decoder_num_blocks)
             ]
@@ -647,8 +614,19 @@ class LightningWrapper(pl.LightningModule):
         self._log("test_loss", loss)
         return loss
 
+    @property
+    def deepspeed_offload(self) -> bool:
+        strategy = self.trainer.strategy
+        if isinstance(strategy, DeepSpeedStrategy):
+            cfg = strategy.config["zero_optimization"]
+            return cfg.get("offload_optimizer") or cfg.get("offload_param")
+        return False
+
     def configure_optimizers(self):
-        return torch.optim.Adam(
+        if self.deepspeed_offload:
+            return DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
+        return torch.optim.AdamW(
             self.parameters(),
-            lr=self.lr,  # momentum=0.9, nesterov=True
+            lr=self.lr,
+            fused=True,
         )
