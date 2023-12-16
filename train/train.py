@@ -148,46 +148,49 @@ datamodule = dataclass(
     **kwargs,
 )
 
-if args.model == "vit":
-    model = LightningWrapper(
-        ViT,
-        image_size=image_size,
-        patch_size=patch_size,
-        image_channels=image_channels,
-        embed_dim=args.embed_dim,
-        mlp_ratio=args.mlp_ratio,
-        num_heads=args.num_heads,
-        num_blocks=args.num_blocks,
-        reattention=args.reattention,
-        parallel_paths=2,
-        dropout=0.1,
-        lr=2e-3,
-        output_head=ClassificationHead(args.embed_dim, output_dim)
-        if args.task == "classification"
-        else DebedHead(args.embed_dim, image_channels, image_size, patch_size)
-        if args.task == "reconstruction"
-        else None,
-        loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,
-    )
-
+if "load_ckpt" in args and args.load_ckpt != "":
+    model = LightningWrapper.load_from_checkpoint(args.load_ckpt)
 
 else:
-    raise ValueError("Invalid model type")
+    if args.model == "vit":
+        model = LightningWrapper(
+            ViT,
+            image_size=image_size,
+            patch_size=patch_size,
+            image_channels=image_channels,
+            embed_dim=args.embed_dim,
+            mlp_ratio=args.mlp_ratio,
+            num_heads=args.num_heads,
+            num_blocks=args.num_blocks,
+            reattention=args.reattention,
+            parallel_paths=2,
+            dropout=0.1,
+            lr=2e-3,
+            output_head=ClassificationHead(args.embed_dim, output_dim)
+            if args.task == "classification"
+            else DebedHead(args.embed_dim, image_channels, image_size, patch_size)
+            if args.task == "reconstruction"
+            else None,
+            loss_fn=F.cross_entropy if args.task == "classification" else F.mse_loss,
+        )
 
-if args.task == "mae":
-    model = LightningWrapper(
-        LightningMAE,
-        vit=model.model,
-        masking_fraction=args.masking_fraction,
-        decoder_num_blocks=args.decoder_num_blocks,
-        logging=True,
-        inner_logging=False,
-        loss_fn=F.mse_loss,
-        lr=2e-3,
-    )
+    else:
+        raise ValueError("Invalid model type")
 
-if args.compile:
-    model = torch.compile(model)
+    if args.task == "mae":
+        model = LightningWrapper(
+            LightningMAE,
+            vit=model.model,
+            masking_fraction=args.masking_fraction,
+            decoder_num_blocks=args.decoder_num_blocks,
+            logging=True,
+            inner_logging=False,
+            loss_fn=F.mse_loss,
+            lr=2e-3,
+        )
+
+    if args.compile:
+        model = torch.compile(model)
 
 if not args.train:
     datamodule.setup()
@@ -209,5 +212,6 @@ else:
         profiler="simple",
     )
     trainer.fit(
-        model, datamodule, ckpt_path=args.load_ckpt if args.load_ckpt != "" else None
+        model,
+        datamodule,  # ckpt_path=args.load_ckpt if args.load_ckpt != "" else None
     )
