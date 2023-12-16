@@ -9,6 +9,8 @@ from einops import repeat
 from functools import cached_property
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning.pytorch.strategies import DeepSpeedStrategy
+from gpt.utils import patchify
+from rotary_embedding_torch import RotaryEmbedding
 
 
 class Attention(nn.Module):
@@ -30,6 +32,8 @@ class Attention(nn.Module):
         self.qnorm = nn.LayerNorm(embed_dim // num_heads)
         self.knorm = nn.LayerNorm(embed_dim // num_heads)
 
+        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+
         self.reattention = reattention
         if reattention:
             self.reattn_weight = nn.Parameter(torch.randn(num_heads, num_heads))
@@ -50,14 +54,14 @@ class Attention(nn.Module):
         is_causal=False,
         scale=None,
     ):
+        B, H, N, C = query.shape
         if self.v_ones is None:
-            B, H, N, C = query.shape
-            self.v_ones = torch.ones((N, N)).expand(B, H, N, N)
+            self.v_ones = torch.ones((N, N)).expand(H, N, N).to(query.device)
 
         attn_weight = F.scaled_dot_product_attention(
             query,
             key,
-            self.v_ones,
+            self.v_ones.expand(B, H, N, N),
             attn_mask=attn_mask,
             dropout_p=dropout_p,
             is_causal=is_causal,
@@ -83,6 +87,8 @@ class Attention(nn.Module):
 
         q = self.qnorm(q)
         k = self.knorm(k)
+
+        q, v = self.rope.rotate_queries_and_keys(q, v)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -348,9 +354,40 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, x):
-        x = x + self.ls1 * self.attns(self.ln1(x))
-        x = x + self.ls2 * self.mlps(self.ln2(x))
+        # x has shape (batch, sequence_length, embed_dim)
+        x = x + self.ls1[None, None, :] * self.attns(self.ln1(x))
+        x = x + self.ls2[None, None, :] * self.mlps(self.ln2(x))
         return x
+
+
+class PEG(nn.Module):
+    """
+    Positional Encoding Generator from https://arxiv.org/pdf/2102.10882.pdf
+    """
+
+    def __init__(self, in_chans, embed_dim=768, kernel_size=3, stride=1):
+        super().__init__()
+        assert kernel_size >= 3, "kernel size must be at least 3"
+        padding = (kernel_size - 1) // 2
+        self.proj = nn.Conv3d(
+            in_chans,
+            embed_dim,
+            kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=True,
+            groups=embed_dim,
+        )
+        self.stride = stride
+
+    def forward(self, x, H, W, D):
+        cnn_feat = rearrange(x, "b (h w d) c -> b c h w d", h=H, w=W, d=D)
+        if self.stride == 1:
+            out = self.proj(cnn_feat) + cnn_feat
+        else:
+            out = self.proj(cnn_feat)
+        out = rearrange(out, "b c h w d -> b (h w d) c")
+        return out
 
 
 class ViT(nn.Module):
@@ -410,11 +447,12 @@ class ViT(nn.Module):
             spatial_dims=self.spatial_dims,
         )
 
-        self.positional_encoding = nn.Parameter(
-            torch.randn(
-                1, np.prod(self.n_patches), embed_dim
-            )  # extra dim at front for batch
-        )
+        # self.positional_encoding = nn.Parameter(
+        #     torch.randn(
+        #         1, np.prod(self.n_patches), embed_dim
+        #     )  # extra dim at front for batch
+        # )
+        self.positional_encoding = PEG(embed_dim, embed_dim)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -438,7 +476,7 @@ class ViT(nn.Module):
         self.output_head = output_head
 
     def forward(self, x):
-        # B, C, H, W = x.shape
+        B, C, H, W = x.shape
 
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
@@ -448,11 +486,22 @@ class ViT(nn.Module):
 
         x = rearrange(x, "b c h w -> b (h w) c")  # (b, n_patches, embed_dim)
 
-        # add positional encoding and do dropout
-        x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
+        # # add positional encoding and do dropout
+        # x = self.dropout(
+        #     x + self.positional_encoding
+        # )  # (batch, n_patches, embed_dim)
 
-        # pass through transformer blocks
-        x = self.blocks(x)  # (batch, sequence_length, embed_dim)
+        # # pass through transformer blocks
+        # x = self.blocks(x)  # (batch, sequence_length, embed_dim)
+
+        # pass through first transformer block
+        x = self.blocks[0](x)
+
+        # add PEG encoding
+        x = x + self.positional_encoding(x, *self.n_patches, 1)
+
+        # pass through remaining transformer blocks
+        x = self.blocks[1:](x)
 
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
@@ -665,7 +714,7 @@ class MAE(nn.Module):
         # project back to image patches
         out = self.debed(decoded_tokens)  # (batch, n_patches, n_pixels_per_patch)
 
-        return patches, out, mask_idx
+        return patchify(x, self.vit.patch_size), out, mask_idx
 
 
 class LightningWrapper(pl.LightningModule):
@@ -724,6 +773,10 @@ class LightningWrapper(pl.LightningModule):
             # if the model is a lightning module, we need to make sure it's not
             # trying to log anything
             self.model.logging = False
+
+    @property
+    def nparams(self):
+        return sum([p.numel() for p in self.parameters()])
 
     def forward(self, x):
         return self.model(x)
