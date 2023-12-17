@@ -13,7 +13,6 @@ args = cfg.config
 
 import os
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import lightning.pytorch as pl
@@ -32,17 +31,20 @@ from gpt.data import (
     Galaxy10DataModule,
     Galaxy10DECalsDataModule,
 )
+from einops import rearrange, repeat
 
 torch.set_float32_matmul_precision("medium")
 
 if args.task == "classification":
-
+    # with fivecrop or tencrop
     def collate(lop):
         x, y = zip(*lop)
         x = torch.stack(x)
-        return x.view(-1, *x.shape[2:]), torch.tensor(y).unsqueeze(-1).repeat(
-            1, x.shape[1]
-        ).view(-1).long()
+        y = torch.tensor(y)
+        ncrops = x.shape[1]
+        y = repeat(y, "n -> n c", c=ncrops).ravel()
+        x = rearrange(x, "b n c h w -> (b n) c h w")
+        return x, y
 
 elif args.task == "reconstruction":
 
@@ -141,7 +143,7 @@ else:
 
 datamodule = dataclass(
     batch_size=args.batch_size,
-    collate_fn=collate,
+    collate_fn_train=collate,
     num_workers=min(os.cpu_count(), 8),
     root_dir=args.data_dir,
     pin_memory=True,
@@ -195,9 +197,10 @@ else:
 if not args.train:
     datamodule.setup()
     tl = datamodule.train_dataloader()
-    b = next(iter(tl))
-    out = model(b)
-    print(out[0].shape, out[1].shape)
+    x, y = next(iter(tl))
+    out = model(x)
+    # print(out[0].shape, out[1].shape)
+    print(out.shape, y.shape)
 
 else:
     trainer = pl.Trainer(

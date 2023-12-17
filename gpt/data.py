@@ -27,7 +27,8 @@ class DataModule(pl.LightningDataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        collate_fn=None,
+        collate_fn_train=None,
+        collate_fn_test=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         nshot=None,
     ):
@@ -36,7 +37,8 @@ class DataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.pin_memory = pin_memory
         self.root_dir = root_dir
-        self.collate_fn = collate_fn
+        self.collate_fn_train = collate_fn_train
+        self.collate_fn_test = collate_fn_test
         self.transform = NotImplemented
         self.trainset = None
         self.testset = None
@@ -100,7 +102,7 @@ class DataModule(pl.LightningDataModule):
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
+            collate_fn=self.collate_fn_train,
         )
 
     def val_dataloader(self):
@@ -110,7 +112,7 @@ class DataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
+            collate_fn=self.collate_fn_test,
         )
 
     def test_dataloader(self):
@@ -120,7 +122,7 @@ class DataModule(pl.LightningDataModule):
             shuffle=False,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            collate_fn=self.collate_fn,
+            collate_fn=self.collate_fn_test,
         )
 
 
@@ -130,7 +132,8 @@ class CIFAR10DataModule(DataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        collate_fn=None,
+        collate_fn_train=None,
+        collate_fn_test=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
         nshot=None,
@@ -139,7 +142,8 @@ class CIFAR10DataModule(DataModule):
             batch_size=batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            collate_fn=collate_fn,
+            collate_fn_train=collate_fn_train,
+            collate_fn_test=collate_fn_test,
             root_dir=root_dir,
             nshot=nshot,
         )
@@ -201,7 +205,8 @@ class MNISTDataModule(DataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        collate_fn=None,
+        collate_fn_train=None,
+        collate_fn_test=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
         nshot=None,
@@ -211,7 +216,8 @@ class MNISTDataModule(DataModule):
             num_workers=num_workers,
             pin_memory=pin_memory,
             root_dir=root_dir,
-            collate_fn=collate_fn,
+            collate_fn_train=collate_fn_train,
+            collate_fn_test=collate_fn_test,
             nshot=nshot,
         )
         self.normalization_means = torch.tensor([0.1307])
@@ -323,7 +329,8 @@ class ImagenetH5DataModule(DataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        collate_fn=None,
+        collate_fn_train=None,
+        collate_fn_test=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
         nshot=None,
@@ -333,7 +340,8 @@ class ImagenetH5DataModule(DataModule):
             num_workers=num_workers,
             pin_memory=pin_memory,
             root_dir=root_dir,
-            collate_fn=collate_fn,
+            collate_fn_train=collate_fn_train,
+            collate_fn_test=collate_fn_test,
             nshot=nshot,
         )
         self.normalization_means = torch.tensor([0.485, 0.456, 0.406])
@@ -386,7 +394,8 @@ class Galaxy10DataModule(DataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        collate_fn=None,
+        collate_fn_train=None,
+        collate_fn_test=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
         nshot=None,
@@ -396,7 +405,8 @@ class Galaxy10DataModule(DataModule):
             num_workers=num_workers,
             pin_memory=pin_memory,
             root_dir=root_dir,
-            collate_fn=collate_fn,
+            collate_fn_train=collate_fn_train,
+            collate_fn_test=collate_fn_test,
             nshot=nshot,
         )
         self.normalization_means = torch.tensor([27.70136783, 23.82405015, 18.14248405])
@@ -445,7 +455,8 @@ class Galaxy10DECalsDataModule(DataModule):
         batch_size=64,
         num_workers=8,
         pin_memory=True,
-        collate_fn=None,
+        collate_fn_train=None,
+        collate_fn_test=None,
         root_dir="/scratch/gpfs/js5013/data/ml/",
         extra_transforms=[],
         nshot=None,
@@ -455,7 +466,8 @@ class Galaxy10DECalsDataModule(DataModule):
             num_workers=num_workers,
             pin_memory=pin_memory,
             root_dir=root_dir,
-            collate_fn=collate_fn,
+            collate_fn_train=collate_fn_train,
+            collate_fn_test=collate_fn_test,
             nshot=nshot,
         )
         self.normalization_means = torch.tensor([42.70678549, 41.4658895, 40.52707873])

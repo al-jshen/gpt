@@ -1,13 +1,13 @@
 [config]
-dataset = "mnist" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
+dataset = "galaxy10" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
 model = "vit" # [vit]
-embed_dim = 384
-mlp_ratio = 2
+embed_dim = 512
+mlp_ratio = 4
 num_blocks = 4
 num_heads = 8
 reattention = true
-batch_size = 64
-precision = "bf16-mixed" # [16-mixed, bf16-mixed, 32-true]
+batch_size = 8
+precision = "bf16-true" # [16-mixed, bf16-mixed, 32-true]
 task = "classification" # [classification, reconstruction, mae]
 decoder_num_blocks = 1
 masking_fraction = 0.75

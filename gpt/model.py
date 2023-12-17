@@ -476,7 +476,7 @@ class ViT(nn.Module):
         self.output_head = output_head
 
     def forward(self, x):
-        B, C, H, W = x.shape
+        # B, C, H, W = x.shape
 
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
@@ -783,7 +783,7 @@ class LightningWrapper(pl.LightningModule):
 
     def _step(self, batch, batch_idx):
         x, y = batch
-        y_hat = self(x)
+        y_hat = self.forward(x)
         loss = self.loss_fn(y_hat, y)
         return loss
 
