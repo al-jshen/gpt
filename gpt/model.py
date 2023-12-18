@@ -648,8 +648,8 @@ class MAE(nn.Module):
 
         n_patches = tokens.shape[1]
 
-        # add positional encoding
-        tokens = tokens + self.vit.positional_encoding  # (batch, n_patches, embed_dim)
+        # add PEG encoding
+        tokens = tokens + self.vit.positional_encoding(tokens, *self.vit.n_patches, 1)
 
         # make random indices to determine what gets mask/kept
         rand_idx = torch.rand(B, n_patches)
