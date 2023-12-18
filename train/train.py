@@ -51,15 +51,15 @@ elif args.task == "reconstruction":
     def collate(lop):
         x, _ = zip(*lop)
         x = torch.stack(x)
-        x = x.view(-1, *x.shape[2:])
-        return (x, x)
+        x = rearrange(x, "b n c h w -> (b n) c h w")
+        return x, x
 
 elif args.task == "mae":
 
     def collate(lop):
         x, _ = zip(*lop)
         x = torch.stack(x)
-        x = x.view(-1, *x.shape[2:])
+        x = rearrange(x, "b n c h w -> (b n) c h w")
         return x
 
 else:

@@ -1,20 +1,20 @@
 [config]
 dataset = "galaxy10" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
 model = "vit" # [vit]
-embed_dim = 512
-mlp_ratio = 4
+embed_dim = 256
+mlp_ratio = 2
 num_blocks = 4
 num_heads = 8
 reattention = true
-batch_size = 8
+batch_size = 4
 precision = "bf16-true" # [16-mixed, bf16-mixed, 32-true]
-task = "classification" # [classification, reconstruction, mae]
+task = "mae" # [classification, reconstruction, mae]
 decoder_num_blocks = 1
-masking_fraction = 0.75
+masking_fraction = 0.7
 strategy = "fsdp" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_x, deepspeed_stage_x_offload]
 epochs = 30
 accelerator = "gpu"
-gpus = 1
+gpus = 2
 # load_ckpt = "/scratch/gpfs/js5013/programs/gpt/train/lightning_logs/version_1038197/checkpoints/epoch=2-step=2346.ckpt"
 # load_ckpt = ""
 data_dir = "/scratch/gpfs/js5013/data/ml/"

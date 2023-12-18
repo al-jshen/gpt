@@ -2,11 +2,11 @@
 
 #SBATCH --nodes=1
 #SBATCH --partition=gpu
-#SBATCH --gpus-per-node=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=2
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=30G
-#SBATCH --time=5:00:00
+#SBATCH --mem=70G
+#SBATCH --time=10:00:00
 
 # debugging flags (optional)
 # export NCCL_DEBUG=INFO
