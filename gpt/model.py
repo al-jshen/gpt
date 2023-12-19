@@ -3,9 +3,8 @@ import torch
 import lightning.pytorch as pl
 import torch.nn as nn
 import torch.nn.functional as F
-from functorch.einops import rearrange
+from einops import rearrange, einsum, repeat
 from einops.layers.torch import Rearrange
-from einops import repeat
 from functools import cached_property
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning.pytorch.strategies import DeepSpeedStrategy
@@ -31,8 +30,7 @@ def drop_path(
 
 
 class DropPath(nn.Module):
-
-    def __init__(self, drop_prob=None, scale_by_keep=True):
+    def __init__(self, drop_prob=0.1, scale_by_keep=True):
         super().__init__()
         self.drop_prob = drop_prob
         self.scale_by_keep = scale_by_keep
@@ -96,9 +94,7 @@ class Attention(nn.Module):
             scale=scale,
         )
 
-        attn_weight = torch.einsum(
-            "b h i j, h g -> b g i j", attn_weight, self.reattn_weight
-        )
+        attn_weight = einsum("b h i j, h g -> b g i j", attn_weight, self.reattn_weight)
         attn_weight = self.reattn_norm(attn_weight)
 
         return attn_weight @ value
@@ -346,6 +342,7 @@ class Parallel(nn.Module):
     def forward(self, x):
         return sum([fn(x) for fn in self.fns])
 
+
 class ConvolutionalSpatialGatingUnit(torch.nn.Module):
     """Convolutional Spatial Gating Unit (CSGU)."""
 
@@ -355,7 +352,6 @@ class ConvolutionalSpatialGatingUnit(torch.nn.Module):
         kernel_size: int,
         dropout_rate: float,
         use_linear_after_conv: bool,
-        gate_activation: str,
     ):
         super().__init__()
 
@@ -374,20 +370,13 @@ class ConvolutionalSpatialGatingUnit(torch.nn.Module):
         else:
             self.linear = None
 
-        if gate_activation == "identity":
-            self.act = torch.nn.Identity()
-        else:
-            self.act = get_activation(gate_activation)
-
         self.dropout = torch.nn.Dropout(dropout_rate)
 
-
-    def forward(self, x, gate_add=None):
+    def forward(self, x):
         """Forward method
 
         Args:
             x (torch.Tensor): (N, T, D)
-            gate_add (torch.Tensor): (N, T, D/2)
 
         Returns:
             out (torch.Tensor): (N, T, D/2)
@@ -399,11 +388,6 @@ class ConvolutionalSpatialGatingUnit(torch.nn.Module):
         x_g = self.conv(x_g.transpose(1, 2)).transpose(1, 2)  # (N, T, D/2)
         if self.linear is not None:
             x_g = self.linear(x_g)
-
-        if gate_add is not None:
-            x_g = x_g + gate_add
-
-        x_g = self.act(x_g)
         out = x_r * x_g  # (N, T, D/2)
         out = self.dropout(out)
         return out
@@ -419,7 +403,6 @@ class ConvolutionalGatingMLP(torch.nn.Module):
         kernel_size: int,
         dropout_rate: float,
         use_linear_after_conv: bool,
-        gate_activation: str,
     ):
         super().__init__()
 
@@ -431,34 +414,35 @@ class ConvolutionalGatingMLP(torch.nn.Module):
             kernel_size=kernel_size,
             dropout_rate=dropout_rate,
             use_linear_after_conv=use_linear_after_conv,
-            gate_activation=gate_activation,
         )
         self.channel_proj2 = torch.nn.Linear(linear_units // 2, size)
 
     def forward(self, x):
-        if isinstance(x, tuple):
-            xs_pad, pos_emb = x
-        else:
-            xs_pad, pos_emb = x, None
+        x = self.channel_proj1(x)  # size -> linear_units
+        x = self.csgu(x)  # linear_units -> linear_units/2
+        x = self.channel_proj2(x)  # linear_units/2 -> size
 
-        xs_pad = self.channel_proj1(xs_pad)  # size -> linear_units
-        xs_pad = self.csgu(xs_pad)  # linear_units -> linear_units/2
-        xs_pad = self.channel_proj2(xs_pad)  # linear_units/2 -> size
-
-        if pos_emb is not None:
-            out = (xs_pad, pos_emb)
-        else:
-            out = xs_pad
-        return out
-
+        return x
 
 
 class TransformerBlock(nn.Module):
+    """Transformer block.
+
+    Additional tweaks:
+    - layerscale (https://arxiv.org/pdf/2103.17239.pdf)
+    - reattention (https://arxiv.org/pdf/2103.11886v4.pdf)
+    - branching and convolutional gating (https://arxiv.org/pdf/2207.02971.pdf)
+    - parallel layers (https://arxiv.org/abs/2203.09795)
+    - rotary positional encoding (https://arxiv.org/pdf/2104.09864.pdf)
+    - drop path (https://arxiv.org/pdf/2106.09681.pdf)
+    """
+
     def __init__(
         self,
         num_heads=12,
         embed_dim=768,
         mlp_ratio=4,
+        conv_kernel_size=21,
         dropout=0.1,
         parallel_paths=2,
         layer_scale=1e-2,
@@ -486,27 +470,34 @@ class TransformerBlock(nn.Module):
                 for _ in range(parallel_paths)
             ]
         )
-        # self.convs = Parallel(
-        #     [
-        #         LocalityFeedForward(embed_dim, embed_dim, 1, mlp_ratio)
-        #         for _ in range(parallel_paths)
-        #     ]
-        # )
+        self.cgmlps = Parallel(
+            [
+                ConvolutionalGatingMLP(
+                    embed_dim,
+                    embed_dim * mlp_ratio,
+                    kernel_size=conv_kernel_size,
+                    dropout_rate=dropout,
+                    use_linear_after_conv=False,
+                )
+            ]
+        )
+        self.proj = nn.Linear(embed_dim * 2, embed_dim)
+        self.drop_path = DropPath(dropout)
 
     def forward(self, x):
         # x has shape (batch, sequence_length, embed_dim)
-        x = x + self.ls1[None, None, :] * self.attns(self.ln1(x))
-        x = x + self.ls2[None, None, :] * self.mlps(self.ln2(x))
-        # n_patches = int(x.shape[1])
-        # x = x + self.ls2[None, None, :] * rearrange(
-        #     self.convs(
-        #         rearrange(
-        #             self.ln2(x), "b (nh nw) c -> b c nh nw", nh=n_patches, nw=n_patches
-        #         )
-        #     ),
-        #     "b c nh nw -> b (nh nw) c",
-        # )
-        return x
+        x_attn = x_mlp = x  # split branches
+        x_attn = x_attn + self.drop_path(
+            self.ls1[None, None, :] * self.attns(self.ln1(x_attn))
+        )
+        x_mlp = x_mlp + self.drop_path(
+            self.ls2[None, None, :] * self.cgmlps(self.ln2(x_mlp))
+        )
+        x_full = torch.cat(
+            (x_attn, x_mlp), dim=-1
+        )  # (batch, sequence_length, embed_dim * 2)
+        x_out = self.proj(x_full) + x  # (batch, sequence_length, embed_dim)
+        return x_out
 
 
 class PEG(nn.Module):
@@ -544,6 +535,7 @@ class ViT(nn.Module):
         self,
         embed_dim=768,
         mlp_ratio=4,
+        conv_kernel_size=21,
         num_heads=12,
         dropout=0.1,
         num_blocks=6,
@@ -557,6 +549,7 @@ class ViT(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.mlp_ratio = mlp_ratio
+        self.conv_kernel_size = conv_kernel_size
         self.num_heads = num_heads
         self.num_blocks = num_blocks
         self.parallel_paths = parallel_paths
@@ -611,6 +604,7 @@ class ViT(nn.Module):
                     num_heads,
                     embed_dim,
                     mlp_ratio,
+                    conv_kernel_size,
                     dropout,
                     parallel_paths,
                     layer_scale=0.1 if i < 9 else 1e-5 if i < 12 else 1e-6,

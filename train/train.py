@@ -166,6 +166,7 @@ def setup(args):
                 image_channels=image_channels,
                 embed_dim=args.embed_dim,
                 mlp_ratio=args.mlp_ratio,
+                conv_kernel_size=args.conv_kernel_size,
                 num_heads=args.num_heads,
                 num_blocks=args.num_blocks,
                 reattention=args.reattention,

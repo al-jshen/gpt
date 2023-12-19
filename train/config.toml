@@ -3,6 +3,7 @@ dataset = "galaxy10" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
 model = "vit" # [vit]
 embed_dim = 256
 mlp_ratio = 2
+conv_kernel_size = 21
 num_blocks = 6
 num_heads = 8
 reattention = true
