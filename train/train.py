@@ -262,6 +262,8 @@ def train(model, datamodule, args):
             enable_progress_bar=True,
             profiler="simple",
             logger=loggers,
+            limit_train_batches=args.limit_data_fraction,
+            limit_val_batches=args.limit_data_fraction,
         )
 
         trainer.fit(
