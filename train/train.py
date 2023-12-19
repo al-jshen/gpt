@@ -213,17 +213,55 @@ def train(model, datamodule, args):
         print(out.shape, y.shape)
 
     else:
+        from lightning.pytorch.loggers import WandbLogger
+        import wandb
+
+        wandb.login(key=args.wandb_key)
+
+        run = wandb.init(
+            # name=config.wandb.name,
+            # id=config.wandb.resume_id if config.wandb.resume else None,
+            project=args.wandb_project,
+            group=args.wandb_group,
+            entity=args.wandb_entity,
+            dir=args.wandb_save_dir,
+            config=args,
+            job_type="train",
+            mode="offline" if args.wandb_offline else None,
+            save_code=True,
+            # resume='allow'
+            notes=args.wandb_notes,
+        )
+
+        wandb_logger = WandbLogger(
+            id=wandb.run.id,
+            name=wandb.run.name,
+            project=args.wandb_project,
+            group=args.wandb_group,
+            entity=cargs.wandb_entity,
+            dir=args.wandb_save_dir,
+            job_type="train",
+            log_model=False if args.wandb_offline else "all",
+            offline=args.wandb_offline,
+        )
+
+        wandb_logger.log_hyperparams(args)
+
+        wandb_logger.watch(model, log="all")
+
         trainer = pl.Trainer(
             accelerator=args.accelerator,
             devices=args.gpus,
             strategy=args.strategy,
             precision=args.precision,
-            # gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
+            gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
             max_epochs=args.epochs,
             enable_model_summary=True,
             enable_progress_bar=True,
             profiler="simple",
+            logger=wandb_logger,
         )
+
         trainer.fit(
             model,
             datamodule,  # ckpt_path=args.load_ckpt if args.load_ckpt != "" else None
