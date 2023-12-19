@@ -10,6 +10,8 @@ from functools import cached_property
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from gpt.utils import patchify
+from gpt.dtn import DTN
+from gpt.lff import LocalityFeedForward
 from rotary_embedding_torch import RotaryEmbedding
 
 
@@ -352,11 +354,26 @@ class TransformerBlock(nn.Module):
                 for _ in range(parallel_paths)
             ]
         )
+        # self.convs = Parallel(
+        #     [
+        #         LocalityFeedForward(embed_dim, embed_dim, 1, mlp_ratio)
+        #         for _ in range(parallel_paths)
+        #     ]
+        # )
 
     def forward(self, x):
         # x has shape (batch, sequence_length, embed_dim)
         x = x + self.ls1[None, None, :] * self.attns(self.ln1(x))
         x = x + self.ls2[None, None, :] * self.mlps(self.ln2(x))
+        # n_patches = int(x.shape[1])
+        # x = x + self.ls2[None, None, :] * rearrange(
+        #     self.convs(
+        #         rearrange(
+        #             self.ln2(x), "b (nh nw) c -> b c nh nw", nh=n_patches, nw=n_patches
+        #         )
+        #     ),
+        #     "b c nh nw -> b (nh nw) c",
+        # )
         return x
 
 
@@ -525,8 +542,6 @@ class ViT(nn.Module):
 
 
 class MAE(nn.Module):
-    ignore_hparams = ["vit"]
-
     def __init__(
         self,
         vit,
@@ -682,8 +697,6 @@ class LightningWrapper(pl.LightningModule):
 
         del_keys = ["lr", "loss_fn", "logging"]
         inner_kwargs = {k: v for k, v in kwargs.items() if k not in del_keys}
-
-        print("inner_kwargs", inner_kwargs)
 
         # build model
         if "checkpoint" in kwargs:
