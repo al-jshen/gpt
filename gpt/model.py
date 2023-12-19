@@ -333,8 +333,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
-        self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale)
-        self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale)
+        self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
+        self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
         self.attns = Parallel(
             [
                 Attention(
@@ -524,80 +524,9 @@ class ViT(nn.Module):
             p.requires_grad = True
 
 
-class LightningMAE(pl.LightningModule):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.save_hyperparameters()
-        assert "lr" in kwargs, "must have lr"
-        assert "loss_fn" in kwargs, "must have loss_fn"
-        if "logging" not in kwargs:
-            kwargs["logging"] = True
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-        # remove lr and loss_fn from kwargs
-        for k in ["lr", "loss_fn", "logging"]:
-            del kwargs[k]
-        # build model
-        self.model = MAE(**kwargs)
-
-    def forward(self, x):
-        return self.model(x)
-
-    def _step(self, batch, batch_idx):
-        mask_patches, out_mask_patches, mask_idx = self.model(batch)
-        batch_indexer = torch.arange(batch.shape[0]).unsqueeze(-1)
-        loss = self.loss_fn(
-            out_mask_patches[batch_indexer, mask_idx],
-            mask_patches[batch_indexer, mask_idx],
-        )
-        return loss
-
-    def _log(self, log_name, loss):
-        if self.logging:
-            self.log(
-                log_name,
-                loss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-            )
-
-    def training_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("train_loss", loss)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("val_loss", loss)
-        return loss
-
-    def testing_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("test_loss", loss)
-        return loss
-
-    @property
-    def deepspeed_offload(self) -> bool:
-        strategy = self.trainer.strategy
-        if isinstance(strategy, DeepSpeedStrategy):
-            cfg = strategy.config["zero_optimization"]
-            return cfg.get("offload_optimizer") or cfg.get("offload_param")
-        return False
-
-    def configure_optimizers(self):
-        if self.deepspeed_offload:
-            return DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.lr,
-            fused=True,
-        )
-
-
 class MAE(nn.Module):
+    ignore_hparams = ["vit"]
+
     def __init__(
         self,
         vit,
@@ -608,6 +537,7 @@ class MAE(nn.Module):
         decoder_dropout=0.1,
     ):
         super().__init__()
+
         self.vit = vit
         num_patches = np.prod(vit.n_patches)
         self.masking_fraction = masking_fraction
@@ -716,6 +646,16 @@ class MAE(nn.Module):
 
         return patchify(x, self.vit.patch_size), out, mask_idx
 
+    def step(self, batch, batch_idx):
+        x = batch
+        mask_patches, out_mask_patches, mask_idx = self(x)
+        batch_indexer = torch.arange(batch.shape[0]).unsqueeze(-1)
+        loss = F.mse_loss(
+            out_mask_patches[batch_indexer, mask_idx],
+            mask_patches[batch_indexer, mask_idx],
+        )
+        return loss
+
 
 class LightningWrapper(pl.LightningModule):
     """
@@ -726,42 +666,24 @@ class LightningWrapper(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # self._build_steps()
-
-        assert "lr" in kwargs, "must have lr"
-        assert "loss_fn" in kwargs, "must have loss_fn"
         if "logging" not in kwargs:
             kwargs["logging"] = True
+
+        if "custom_step" in kwargs:
+            self.custom_step = kwargs["custom_step"]
+        else:
+            self.custom_step = None
+
         for k, v in kwargs.items():
             if not k.startswith("inner_"):
                 setattr(self, k, v)
 
         self.modelclass = modelclass
-        if issubclass(modelclass, pl.LightningModule):
-            self.wraps_lightning = True
-            inner_kwargs = {}
 
-            for k, v in kwargs.items():
-                # if there is the same key but with inner_, use that
-                if f"inner_{k}" in kwargs:
-                    inner_kwargs[k] = kwargs[f"inner_{k}"]
-                else:
-                    if not k.startswith("inner_"):
-                        inner_kwargs[k] = v
-                    else:
-                        inner_kwargs[k.replace("inner_", "")] = v
+        del_keys = ["lr", "loss_fn", "logging"]
+        inner_kwargs = {k: v for k, v in kwargs.items() if k not in del_keys}
 
-            # logging handled by outer wrapper
-            inner_kwargs["logging"] = False
-
-        else:
-            self.wraps_lightning = False
-            # remove lr and loss_fn from kwargs
-            inner_kwargs = kwargs.copy()
-            del_keys = ["lr", "loss_fn", "logging"]
-            for k in del_keys:
-                if k in inner_kwargs:
-                    del inner_kwargs[k]
+        print("inner_kwargs", inner_kwargs)
 
         # build model
         if "checkpoint" in kwargs:
@@ -769,10 +691,12 @@ class LightningWrapper(pl.LightningModule):
         else:
             self.model = modelclass(**inner_kwargs)
 
-        if self.wraps_lightning:
-            # if the model is a lightning module, we need to make sure it's not
-            # trying to log anything
-            self.model.logging = False
+        self.custom_step = hasattr(self.model, "step")
+
+        assert (
+            self.custom_step or "loss_fn" in kwargs
+        ), "must have loss_fn or custom step (step method in modelclass)"
+        assert "lr" in kwargs, "must have lr"
 
     @property
     def nparams(self):
@@ -782,6 +706,9 @@ class LightningWrapper(pl.LightningModule):
         return self.model(x)
 
     def _step(self, batch, batch_idx):
+        if self.custom_step:
+            return self.model.step(batch, batch_idx)
+
         x, y = batch
         y_hat = self.forward(x)
         loss = self.loss_fn(y_hat, y)
@@ -800,26 +727,17 @@ class LightningWrapper(pl.LightningModule):
             )
 
     def training_step(self, batch, batch_idx):
-        if self.wraps_lightning:
-            loss = self.model.training_step(batch, batch_idx)
-        else:
-            loss = self._step(batch, batch_idx)
+        loss = self._step(batch, batch_idx)
         self._log("train_loss", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        if self.wraps_lightning:
-            loss = self.model.validation_step(batch, batch_idx)
-        else:
-            loss = self._step(batch, batch_idx)
+        loss = self._step(batch, batch_idx)
         self._log("val_loss", loss)
         return loss
 
     def testing_step(self, batch, batch_idx):
-        if self.wraps_lightning:
-            loss = self.model.validation_step(batch, batch_idx)
-        else:
-            loss = self._step(batch, batch_idx)
+        loss = self._step(batch, batch_idx)
         self._log("test_loss", loss)
         return loss
 

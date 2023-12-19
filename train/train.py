@@ -12,9 +12,9 @@ def setup(args):
     from gpt.model import (
         DebedHead,
         ViT,
+        MAE,
         LightningWrapper,
         ClassificationHead,
-        LightningMAE,
         Lambda,
     )
     from gpt.data import (
@@ -187,13 +187,11 @@ def setup(args):
 
         if args.task == "mae":
             model = LightningWrapper(
-                LightningMAE,
+                MAE,
                 vit=model.model,
                 masking_fraction=args.masking_fraction,
                 decoder_num_blocks=args.decoder_num_blocks,
                 logging=True,
-                inner_logging=False,
-                loss_fn=F.mse_loss,
                 lr=2e-3,
             )
 
@@ -213,53 +211,57 @@ def train(model, datamodule, args):
         print(out.shape, y.shape)
 
     else:
-        from lightning.pytorch.loggers import WandbLogger
-        import wandb
+        from lightning.pytorch.loggers import WandbLogger, TensorBoardLogger
 
-        wandb.login(key=args.wandb_key)
+        loggers = [TensorBoardLogger(args.wandb_save_dir)]
 
-        run = wandb.init(
-            # name=config.wandb.name,
-            # id=config.wandb.resume_id if config.wandb.resume else None,
-            project=args.wandb_project,
-            group=args.wandb_group,
-            entity=args.wandb_entity,
-            dir=args.wandb_save_dir,
-            config=args,
-            job_type="train",
-            mode="offline" if args.wandb_offline else None,
-            save_code=True,
-            # resume='allow'
-            notes=args.wandb_notes,
-        )
+        if args.wandb_track:
+            import wandb
 
-        wandb_logger = WandbLogger(
-            id=wandb.run.id,
-            name=wandb.run.name,
-            project=args.wandb_project,
-            group=args.wandb_group,
-            entity=cargs.wandb_entity,
-            dir=args.wandb_save_dir,
-            job_type="train",
-            log_model=False if args.wandb_offline else "all",
-            offline=args.wandb_offline,
-        )
+            wandb.login(key=args.wandb_key)
 
-        wandb_logger.log_hyperparams(args)
+            run = wandb.init(
+                project=args.wandb_project,
+                group=args.wandb_group,
+                entity=args.wandb_entity,
+                dir=args.wandb_save_dir,
+                config=args,
+                job_type="train",
+                mode="offline" if args.wandb_offline else None,
+                save_code=True,
+                resume="allow",
+                notes=args.wandb_notes,
+            )
 
-        wandb_logger.watch(model, log="all")
+            wandb_logger = WandbLogger(
+                id=wandb.run.id,
+                name=wandb.run.name,
+                project=args.wandb_project,
+                group=args.wandb_group,
+                entity=args.wandb_entity,
+                dir=args.wandb_save_dir,
+                job_type="train",
+                log_model=False if args.wandb_offline else "all",
+                offline=args.wandb_offline,
+            )
+
+            wandb_logger.log_hyperparams(args)
+
+            wandb_logger.watch(model, log="all")
+
+            loggers.append(wandb_logger)
 
         trainer = pl.Trainer(
             accelerator=args.accelerator,
             devices=args.gpus,
             strategy=args.strategy,
             precision=args.precision,
-            gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
+            # gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
             max_epochs=args.epochs,
             enable_model_summary=True,
             enable_progress_bar=True,
             profiler="simple",
-            logger=wandb_logger,
+            logger=loggers,
         )
 
         trainer.fit(

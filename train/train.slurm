@@ -1,16 +1,14 @@
 #!/bin/bash
 
 #SBATCH --nodes=1
-#SBATCH --partition=gpu
+#SBATCH -p gpupreempt
+#SBATCH -q gpupreempt
+#SBATCH -C "h100|a100-80gb|a100"
 #SBATCH --gpus-per-node=2
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=70G
-#SBATCH --time=10:00:00
-
-# debugging flags (optional)
-# export NCCL_DEBUG=INFO
-# export PYTHONFAULTHANDLER=1
+#SBATCH --mem=50G
+#SBATCH --time=1:00:00
 
 # run script from above
 srun python3 train.py --config config.toml 
