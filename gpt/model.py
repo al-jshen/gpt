@@ -15,6 +15,32 @@ from gpt.lff import LocalityFeedForward
 from rotary_embedding_torch import RotaryEmbedding
 
 
+def drop_path(
+    x, drop_prob: float = 0.0, training: bool = False, scale_by_keep: bool = True
+):
+    if drop_prob == 0.0 or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (
+        x.ndim - 1
+    )  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = x.new_empty(shape).bernoulli_(keep_prob)
+    if keep_prob > 0.0 and scale_by_keep:
+        random_tensor.div_(keep_prob)
+    return x * random_tensor
+
+
+class DropPath(nn.Module):
+
+    def __init__(self, drop_prob=None, scale_by_keep=True):
+        super().__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
+
+
 class Attention(nn.Module):
     def __init__(self, num_heads=12, embed_dim=768, dropout=0.1, reattention=False):
         super().__init__()
@@ -319,6 +345,112 @@ class Parallel(nn.Module):
 
     def forward(self, x):
         return sum([fn(x) for fn in self.fns])
+
+class ConvolutionalSpatialGatingUnit(torch.nn.Module):
+    """Convolutional Spatial Gating Unit (CSGU)."""
+
+    def __init__(
+        self,
+        size: int,
+        kernel_size: int,
+        dropout_rate: float,
+        use_linear_after_conv: bool,
+        gate_activation: str,
+    ):
+        super().__init__()
+
+        n_channels = size // 2  # split input channels
+        self.norm = nn.LayerNorm(n_channels)
+        self.conv = torch.nn.Conv1d(
+            n_channels,
+            n_channels,
+            kernel_size,
+            1,
+            (kernel_size - 1) // 2,
+            groups=n_channels,
+        )
+        if use_linear_after_conv:
+            self.linear = torch.nn.Linear(n_channels, n_channels)
+        else:
+            self.linear = None
+
+        if gate_activation == "identity":
+            self.act = torch.nn.Identity()
+        else:
+            self.act = get_activation(gate_activation)
+
+        self.dropout = torch.nn.Dropout(dropout_rate)
+
+
+    def forward(self, x, gate_add=None):
+        """Forward method
+
+        Args:
+            x (torch.Tensor): (N, T, D)
+            gate_add (torch.Tensor): (N, T, D/2)
+
+        Returns:
+            out (torch.Tensor): (N, T, D/2)
+        """
+
+        x_r, x_g = x.chunk(2, dim=-1)
+
+        x_g = self.norm(x_g)  # (N, T, D/2)
+        x_g = self.conv(x_g.transpose(1, 2)).transpose(1, 2)  # (N, T, D/2)
+        if self.linear is not None:
+            x_g = self.linear(x_g)
+
+        if gate_add is not None:
+            x_g = x_g + gate_add
+
+        x_g = self.act(x_g)
+        out = x_r * x_g  # (N, T, D/2)
+        out = self.dropout(out)
+        return out
+
+
+class ConvolutionalGatingMLP(torch.nn.Module):
+    """Convolutional Gating MLP (cgMLP)."""
+
+    def __init__(
+        self,
+        size: int,
+        linear_units: int,
+        kernel_size: int,
+        dropout_rate: float,
+        use_linear_after_conv: bool,
+        gate_activation: str,
+    ):
+        super().__init__()
+
+        self.channel_proj1 = torch.nn.Sequential(
+            torch.nn.Linear(size, linear_units), torch.nn.GELU()
+        )
+        self.csgu = ConvolutionalSpatialGatingUnit(
+            size=linear_units,
+            kernel_size=kernel_size,
+            dropout_rate=dropout_rate,
+            use_linear_after_conv=use_linear_after_conv,
+            gate_activation=gate_activation,
+        )
+        self.channel_proj2 = torch.nn.Linear(linear_units // 2, size)
+
+    def forward(self, x):
+        if isinstance(x, tuple):
+            xs_pad, pos_emb = x
+        else:
+            xs_pad, pos_emb = x, None
+
+        xs_pad = self.channel_proj1(xs_pad)  # size -> linear_units
+        xs_pad = self.csgu(xs_pad)  # linear_units -> linear_units/2
+        xs_pad = self.channel_proj2(xs_pad)  # linear_units/2 -> size
+
+        if pos_emb is not None:
+            out = (xs_pad, pos_emb)
+        else:
+            out = xs_pad
+        return out
+
 
 
 class TransformerBlock(nn.Module):
