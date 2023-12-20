@@ -541,7 +541,6 @@ class ViT(nn.Module):
         num_blocks=6,
         parallel_paths=2,
         image_channels=3,
-        image_size=(256, 256),
         patch_size=(16, 16),
         reattention=True,
         output_head=None,
@@ -554,17 +553,12 @@ class ViT(nn.Module):
         self.num_blocks = num_blocks
         self.parallel_paths = parallel_paths
         self.image_channels = image_channels
-        self.image_size = image_size
         self.patch_size = patch_size
-        self.spatial_dims = len(image_size)
+        self.spatial_dims = len(patch_size)
         assert len(patch_size) == self.spatial_dims
-        for d in range(self.spatial_dims):
-            assert (
-                image_size[d] % patch_size[d] == 0
-            ), f"image size must be divisible by patch size in all spatial dims, mismatch in dim {d+1}"
-        self.n_patches: tuple[int, ...] = tuple(
-            [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
-        )
+        # self.n_patches: tuple[int, ...] = tuple(
+        #     [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
+        # )
 
         # patch_dim = np.prod(patch_size) * image_channels
 
@@ -621,6 +615,10 @@ class ViT(nn.Module):
     def forward(self, x):
         # B, C, H, W = x.shape
 
+        n_patches = tuple(
+            [x.shape[2 + d] // self.patch_size[d] for d in range(self.spatial_dims)]
+        )
+
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
 
@@ -641,7 +639,7 @@ class ViT(nn.Module):
         x = self.blocks[0](x)
 
         # add PEG encoding
-        x = x + self.positional_encoding(x, *self.n_patches, 1)
+        x = x + self.positional_encoding(x, *n_patches, 1)
 
         # pass through remaining transformer blocks
         x = self.blocks[1:](x)
