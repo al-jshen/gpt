@@ -81,8 +81,12 @@ class Attention(nn.Module):
         scale=None,
     ):
         B, H, N, C = query.shape
-        if self.v_ones is None:
-            self.v_ones = torch.ones((N, N)).expand(H, N, N).to(query.device)
+        if self.v_ones is None or self.v_ones.shape[1] != N:
+            self.v_ones = (
+                torch.ones((N, N))
+                .expand(H, N, N)
+                .to(device=query.device, dtype=query.dtype)
+            )
 
         attn_weight = F.scaled_dot_product_attention(
             query,
@@ -594,13 +598,17 @@ class ViT(nn.Module):
         #     nn.LayerNorm(embed_dim),
         # )
 
-        self.input_head_weights = nn.Parameter(
-            torch.randn(image_channels, embed_dim // 8)
+        self.input_head = nn.Conv2d(
+            image_channels,
+            embed_dim // 4,
+            kernel_size=1,
+            stride=1,
+            bias=False,
         )
 
         self.patch_embed = hMLP_stem(
             patch_size=patch_size,
-            in_chans=embed_dim // 8,
+            in_chans=embed_dim // 4,
             embed_dim=embed_dim,
             spatial_dims=self.spatial_dims,
         )
@@ -644,7 +652,8 @@ class ViT(nn.Module):
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
 
-        x = einsum(x, self.input_head_weights, "b c1 h w, c1 c2 -> b c2 h w")
+        # x = einsum(x, self.input_head_weights, "b c1 h w, c1 c2 -> b c2 h w")
+        x = self.input_head(x)
 
         # embed patches
         x = self.patch_embed(x)  # (b, embed_dim, nh, nw)
@@ -912,8 +921,19 @@ class LightningWrapper(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.deepspeed_offload:
-            return DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
-        return torch.optim.AdamW(
-            self.parameters(),
-            lr=self.lr,
+            optimizer = DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
+        else:
+            optimizer = torch.optim.AdamW(
+                self.parameters(),
+                lr=self.lr,
+            )
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=100, T_mult=1, eta_min=1e-6
         )
+        scheduler = {
+            "scheduler": lr_scheduler,
+            "interval": "step",
+            "frequency": 1,
+            "strict": True,
+        }
+        return [optimizer], [scheduler]
