@@ -357,7 +357,7 @@ class ConvolutionalSpatialGatingUnit(torch.nn.Module):
 
         n_channels = size // 2  # split input channels
         self.norm = nn.LayerNorm(n_channels)
-        self.conv = torch.nn.Conv1d(
+        self.dwconv = torch.nn.Conv1d(
             n_channels,
             n_channels,
             kernel_size,
@@ -385,7 +385,7 @@ class ConvolutionalSpatialGatingUnit(torch.nn.Module):
         x_r, x_g = x.chunk(2, dim=-1)
 
         x_g = self.norm(x_g)  # (N, T, D/2)
-        x_g = self.conv(x_g.transpose(1, 2)).transpose(1, 2)  # (N, T, D/2)
+        x_g = self.dwconv(x_g.transpose(1, 2)).transpose(1, 2)  # (N, T, D/2)
         if self.linear is not None:
             x_g = self.linear(x_g)
         out = x_r * x_g  # (N, T, D/2)
@@ -431,7 +431,8 @@ class TransformerBlock(nn.Module):
     Additional tweaks:
     - layerscale (https://arxiv.org/pdf/2103.17239.pdf)
     - reattention (https://arxiv.org/pdf/2103.11886v4.pdf)
-    - branching and convolutional gating (https://arxiv.org/pdf/2207.02971.pdf)
+    - branching and convolutional gating for global+local info (https://arxiv.org/pdf/2207.02971.pdf)
+    - depth-wise convolutional merging (https://arxiv.org/pdf/2210.00077.pdf)
     - parallel layers (https://arxiv.org/abs/2203.09795)
     - rotary positional encoding (https://arxiv.org/pdf/2104.09864.pdf)
     - drop path (https://arxiv.org/pdf/2106.09681.pdf)
@@ -442,7 +443,7 @@ class TransformerBlock(nn.Module):
         num_heads=12,
         embed_dim=768,
         mlp_ratio=4,
-        conv_kernel_size=21,
+        conv_kernel_size=31,
         dropout=0.1,
         parallel_paths=2,
         layer_scale=1e-2,
@@ -484,24 +485,36 @@ class TransformerBlock(nn.Module):
                 for _ in range(parallel_paths)
             ]
         )
+        self.mlp1 = MLP(embed_dim, embed_dim * 2, dropout=dropout)
+        self.mlp2 = MLP(embed_dim, embed_dim * 2, dropout=dropout)
+        self.dwconv = nn.Conv1d(
+            embed_dim * 2,
+            embed_dim * 2,
+            kernel_size=conv_kernel_size,
+            stride=1,
+            padding=(conv_kernel_size - 1) // 2,
+            groups=embed_dim * 2,
+        )
         self.proj = nn.Linear(embed_dim * 2, embed_dim)
         self.drop_path = DropPath(dropout)
 
     def forward(self, x):
         # x has shape (batch, sequence_length, embed_dim)
-        x_attn = x_cgmlp = x  # split branches
-        x_attn = (
-            x_attn
-            + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x_attn)))
-            + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x_attn)))
+        x = self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
+        x1 = x2 = x  # split branches
+        x1 = (
+            x1
+            + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+            + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
         )
-        x_cgmlp = x_cgmlp + self.drop_path(
-            self.ls3[None, None, :] * self.cgmlps(self.ln3(x_cgmlp))
-        )
-        x_full = torch.cat(
-            (x_attn, x_cgmlp), dim=-1
+        x2 = x2 + self.drop_path(self.ls3[None, None, :] * self.cgmlps(self.ln3(x2)))
+        x_out = torch.cat((x1, x2), dim=-1)  # (batch, sequence_length, embed_dim * 2)
+        # e-branchformer style merge
+        x_out = (
+            self.dwconv(x_out.transpose(1, 2)).transpose(1, 2) + x_out
         )  # (batch, sequence_length, embed_dim * 2)
-        x_out = self.proj(x_full) + x  # (batch, sequence_length, embed_dim)
+        x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
+        x_out = self.mlp2(x_out) + x_out
         return x_out
 
 
@@ -540,7 +553,7 @@ class ViT(nn.Module):
         self,
         embed_dim=768,
         mlp_ratio=4,
-        conv_kernel_size=21,
+        conv_kernel_size=31,
         num_heads=12,
         dropout=0.1,
         num_blocks=6,
@@ -581,9 +594,13 @@ class ViT(nn.Module):
         #     nn.LayerNorm(embed_dim),
         # )
 
+        self.input_head_weights = nn.Parameter(
+            torch.randn(image_channels, embed_dim // 8)
+        )
+
         self.patch_embed = hMLP_stem(
             patch_size=patch_size,
-            in_chans=image_channels,
+            in_chans=embed_dim // 8,
             embed_dim=embed_dim,
             spatial_dims=self.spatial_dims,
         )
@@ -626,6 +643,8 @@ class ViT(nn.Module):
 
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
+
+        x = einsum(x, self.input_head_weights, "b c1 h w, c1 c2 -> b c2 h w")
 
         # embed patches
         x = self.patch_embed(x)  # (b, embed_dim, nh, nw)
