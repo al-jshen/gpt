@@ -153,7 +153,7 @@ class CIFAR10DataModule(DataModule):
         )
         self.normalization_stds = torch.tensor([x / 255.0 for x in [63.0, 62.1, 66.7]])
 
-        self.transform = transforms.Compose(
+        self.transform_train = transforms.Compose(
             [
                 to_tensor,
                 transforms.Normalize(
@@ -161,6 +161,16 @@ class CIFAR10DataModule(DataModule):
                     std=self.normalization_stds,
                 ),
                 *extra_transforms,
+            ]
+        )
+        self.transform_test = transforms.Compose(
+            [
+                to_tensor,
+                transforms.Normalize(
+                    mean=self.normalization_means,
+                    std=self.normalization_stds,
+                ),
+                transforms.CenterCrop(32),
             ]
         )
 
@@ -179,6 +189,14 @@ class CIFAR10DataModule(DataModule):
             "truck",
         ]
 
+    @property
+    def image_size(self):
+        return (32, 32)
+
+    @property
+    def image_channels(self):
+        return 3
+
     def prepare_data(self):
         torchvision.datasets.CIFAR10(root=self.root_dir, train=True, download=True)
         torchvision.datasets.CIFAR10(root=self.root_dir, train=False, download=True)
@@ -189,13 +207,13 @@ class CIFAR10DataModule(DataModule):
                 root=self.root_dir,
                 train=True,
                 download=False,
-                transform=self.transform,
+                transform=self.transform_train,
             )
             self.testset = torchvision.datasets.CIFAR10(
                 root=self.root_dir,
                 train=False,
                 download=False,
-                transform=self.transform,
+                transform=self.transform_test,
             )
 
 
@@ -223,17 +241,32 @@ class MNISTDataModule(DataModule):
         self.normalization_means = torch.tensor([0.1307])
         self.normalization_stds = torch.tensor([0.3081])
 
-        self.transform = transforms.Compose(
+        self.transform_train = transforms.Compose(
             [
                 to_tensor,
                 transforms.Normalize(self.normalization_means, self.normalization_stds),
                 *extra_transforms,
             ]
         )
+        self.transform_test = transforms.Compose(
+            [
+                to_tensor,
+                transforms.Normalize(self.normalization_means, self.normalization_stds),
+                transforms.CenterCrop(28),
+            ]
+        )
 
     @property
     def classes(self):
         return list(range(10))
+
+    @property
+    def image_size(self):
+        return (28, 28)
+
+    @property
+    def image_channels(self):
+        return 1
 
     def prepare_data(self):
         torchvision.datasets.MNIST(root=self.root_dir, train=True, download=True)
@@ -245,13 +278,13 @@ class MNISTDataModule(DataModule):
                 root=self.root_dir,
                 train=True,
                 download=False,
-                transform=self.transform,
+                transform=self.transform_train,
             )
             self.testset = torchvision.datasets.MNIST(
                 root=self.root_dir,
                 train=False,
                 download=False,
-                transform=self.transform,
+                transform=self.transform_test,
             )
 
 
@@ -369,6 +402,14 @@ class ImagenetH5DataModule(DataModule):
     def classes(self):
         return list(IMAGENET_CLASSES.items())
 
+    @property
+    def image_size(self):
+        return (224, 224)
+
+    @property
+    def image_channels(self):
+        return 3
+
     def prepare_data(self):
         pass
 
@@ -432,6 +473,14 @@ class Galaxy10DataModule(DataModule):
     def classes(self):
         return list(range(10))
 
+    @property
+    def image_size(self):
+        return (64, 64)
+
+    @property
+    def image_channels(self):
+        return 3
+
     def prepare_data(self):
         pass
 
@@ -493,6 +542,14 @@ class Galaxy10DECalsDataModule(DataModule):
     def classes(self):
         return list(range(10))
 
+    @property
+    def image_size(self):
+        return (224, 224)
+
+    @property
+    def image_channels(self):
+        return 3
+
     def prepare_data(self):
         pass
 
@@ -508,12 +565,3 @@ class Galaxy10DECalsDataModule(DataModule):
                 transform_train=self.transform_train,
                 transform_test=self.transform_test,
             )
-
-
-class AddGaussianNoise:
-    def __init__(self, amount=0.1):
-        self.amount = amount
-
-    def __call__(self, tensor):
-        std = torch.std(tensor)
-        return tensor + torch.randn(tensor.size()) * (std * self.amount)
