@@ -71,9 +71,7 @@ def setup(args):
         raise ValueError("Invalid task")
 
     if args.dataset == "cifar10":
-        image_size = (32, 32)
         patch_size = (4, 4)
-        image_channels = 3
         output_dim = 10
         kwargs = dict(
             extra_transforms=[
@@ -86,9 +84,7 @@ def setup(args):
         dataclass = CIFAR10DataModule
 
     elif args.dataset == "galaxy10":
-        image_size = (64, 64)
         patch_size = (4, 4)
-        image_channels = 3
         output_dim = 10
         kwargs = dict(
             extra_transforms=[
@@ -100,9 +96,7 @@ def setup(args):
         dataclass = Galaxy10DataModule
 
     elif args.dataset == "galaxy10decals":
-        image_size = (224, 224)
         patch_size = (16, 16)
-        image_channels = 3
         output_dim = 10
         kwargs = dict(
             extra_transforms=[
@@ -114,9 +108,7 @@ def setup(args):
         dataclass = Galaxy10DECalsDataModule
 
     elif args.dataset == "mnist":
-        image_size = (28, 28)
         patch_size = (4, 4)
-        image_channels = 1
         output_dim = 10
         kwargs = dict(
             extra_transforms=[
@@ -129,9 +121,7 @@ def setup(args):
         dataclass = MNISTDataModule
 
     elif args.dataset == "imagenet":
-        image_size = (224, 224)
         patch_size = (16, 16)
-        image_channels = 3
         output_dim = 1000
         kwargs = dict(
             extra_transforms=[
@@ -161,21 +151,25 @@ def setup(args):
         if args.model == "vit":
             model = LightningWrapper(
                 ViT,
-                image_size=image_size,
                 patch_size=patch_size,
-                image_channels=image_channels,
+                image_channels=datamodule.image_channels,
                 embed_dim=args.embed_dim,
                 mlp_ratio=args.mlp_ratio,
                 conv_kernel_size=args.conv_kernel_size,
                 num_heads=args.num_heads,
                 num_blocks=args.num_blocks,
                 reattention=args.reattention,
-                parallel_paths=2,
+                parallel_paths=args.parallel_paths,
                 dropout=0.1,
-                lr=2e-3,
+                lr=1e-3,
                 output_head=ClassificationHead(args.embed_dim, output_dim)
                 if args.task == "classification"
-                else DebedHead(args.embed_dim, image_channels, image_size, patch_size)
+                else DebedHead(
+                    args.embed_dim,
+                    datamodule.image_channels,
+                    datamodule.image_size,
+                    patch_size,
+                )
                 if args.task == "reconstruction"
                 else None,
                 loss_fn=F.cross_entropy
@@ -193,11 +187,11 @@ def setup(args):
                 masking_fraction=args.masking_fraction,
                 decoder_num_blocks=args.decoder_num_blocks,
                 logging=True,
-                lr=2e-3,
+                lr=1e-3,
             )
 
         if args.compile:
-            model = torch.compile(model)
+            model.model = torch.compile(model.model)
 
     return model, datamodule
 

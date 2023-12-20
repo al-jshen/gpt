@@ -436,7 +436,7 @@ class TransformerBlock(nn.Module):
     - layerscale (https://arxiv.org/pdf/2103.17239.pdf)
     - reattention (https://arxiv.org/pdf/2103.11886v4.pdf)
     - branching and convolutional gating for global+local info (https://arxiv.org/pdf/2207.02971.pdf)
-    - depth-wise convolutional merging (https://arxiv.org/pdf/2210.00077.pdf)
+    - depth-wise convolutional merging and macaron attention (https://arxiv.org/pdf/2210.00077.pdf, https://arxiv.org/pdf/1906.02762.pdf)
     - parallel layers (https://arxiv.org/abs/2203.09795)
     - rotary positional encoding (https://arxiv.org/pdf/2104.09864.pdf)
     - drop path (https://arxiv.org/pdf/2106.09681.pdf)

@@ -1,33 +1,34 @@
 [config]
-dataset = "galaxy10" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
+dataset = "mnist" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
 model = "vit" # [vit]
 embed_dim = 256
-mlp_ratio = 2
-conv_kernel_size = 21
+mlp_ratio = 4
+conv_kernel_size = 31
 num_blocks = 6
 num_heads = 8
 reattention = true
+parallel_paths = 2
 batch_size = 64
 precision = "bf16-mixed" # [16-mixed, bf16-mixed, 32-true]
-task = "mae" # [classification, reconstruction, mae]
+task = "classification" # [classification, reconstruction, mae]
 decoder_num_blocks = 1
-masking_fraction = 0.4
-strategy = "ddp_find_unused_parameters_true" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_x, deepspeed_stage_x_offload]
-epochs = 1
+masking_fraction = 0.75
+strategy = "ddp" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_x, deepspeed_stage_x_offload]
+epochs = 25
 limit_data_fraction = 1.0
 accelerator = "gpu"
 gpus = 1
-# load_ckpt = "/scratch/gpfs/js5013/programs/gpt/train/lightning_logs/version_1038197/checkpoints/epoch=2-step=2346.ckpt"
+# load_ckpt = "/mnt/home/jshen/ceph/programs/gpt/train/lightning_logs/version_22/checkpoints/epoch=22-step=21574.ckpt"
 # load_ckpt = ""
 data_dir = "/mnt/home/jshen/ceph/data/ml/"
 train = true
 nshot = 0 # 0 for full training data
 compile = false
-wandb_track = false
+wandb_track = true
 wandb_entity = "j_shen"
 wandb_project = "gpt"
-wandb_group = "galaxy10"
-wandb_notes = "mae"
+wandb_group = "mnist"
+wandb_notes = "wider and deeper"
 wandb_offline = false
 wandb_save_dir = "/mnt/home/jshen/ceph/programs/gpt/train/"
 wandb_key = "8b68006c061aeb7ad95f4dbdcc8bb2699f0c1da9"
