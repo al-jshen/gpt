@@ -94,7 +94,7 @@ class Attention(nn.Module):
             scale=scale,
         )
 
-        attn_weight = einsum("b h i j, h g -> b g i j", attn_weight, self.reattn_weight)
+        attn_weight = einsum(attn_weight, self.reattn_weight, "b h i j, h g -> b g i j")
         attn_weight = self.reattn_norm(attn_weight)
 
         return attn_weight @ value
@@ -451,8 +451,10 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
+        self.ln3 = nn.LayerNorm(embed_dim)
         self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
         self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
+        self.ls3 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
         self.attns = Parallel(
             [
                 Attention(
@@ -479,6 +481,7 @@ class TransformerBlock(nn.Module):
                     dropout_rate=dropout,
                     use_linear_after_conv=False,
                 )
+                for _ in range(parallel_paths)
             ]
         )
         self.proj = nn.Linear(embed_dim * 2, embed_dim)
@@ -486,15 +489,17 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x):
         # x has shape (batch, sequence_length, embed_dim)
-        x_attn = x_mlp = x  # split branches
-        x_attn = x_attn + self.drop_path(
-            self.ls1[None, None, :] * self.attns(self.ln1(x_attn))
+        x_attn = x_cgmlp = x  # split branches
+        x_attn = (
+            x_attn
+            + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x_attn)))
+            + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x_attn)))
         )
-        x_mlp = x_mlp + self.drop_path(
-            self.ls2[None, None, :] * self.cgmlps(self.ln2(x_mlp))
+        x_cgmlp = x_cgmlp + self.drop_path(
+            self.ls3[None, None, :] * self.cgmlps(self.ln3(x_cgmlp))
         )
         x_full = torch.cat(
-            (x_attn, x_mlp), dim=-1
+            (x_attn, x_cgmlp), dim=-1
         )  # (batch, sequence_length, embed_dim * 2)
         x_out = self.proj(x_full) + x  # (batch, sequence_length, embed_dim)
         return x_out
@@ -892,5 +897,4 @@ class LightningWrapper(pl.LightningModule):
         return torch.optim.AdamW(
             self.parameters(),
             lr=self.lr,
-            fused=True,
         )
