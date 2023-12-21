@@ -39,7 +39,11 @@ def setup(args):
             x = rearrange(x, "b n c h w -> (b n) c h w")
             return x, y.long()
 
-        collate_test = None
+        def collate_test(lop):
+            x, y = zip(*lop)
+            x = torch.stack(x)
+            y = torch.tensor(y)
+            return x, y.long()
 
     elif args.task == "reconstruction":
 
