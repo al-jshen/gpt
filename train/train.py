@@ -37,7 +37,7 @@ def setup(args):
             ncrops = x.shape[1]
             y = repeat(y, "n -> n c", c=ncrops).ravel()
             x = rearrange(x, "b n c h w -> (b n) c h w")
-            return x, y
+            return x, y.long()
 
         collate_test = None
 
