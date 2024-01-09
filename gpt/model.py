@@ -116,7 +116,7 @@ class Attention(nn.Module):
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        q, v = self.rope.rotate_queries_and_keys(q, v)
+        q, k = self.rope.rotate_queries_and_keys(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -426,40 +426,129 @@ class ConvolutionalGatingMLP(torch.nn.Module):
 
 
 class AxialAttention(nn.Module):
-    def __init__(self, embed_dim=256, num_heads=8, dropout=0.1, reattention=True):
+    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1, reattention=False):
         super().__init__()
-        self.attn = Attention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            reattention=reattention,
+
+        assert (
+            embed_dim % num_heads == 0
+        ), "Embedding dimension must be divisible by number of heads"
+
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.dropout = dropout
+
+        self.norm1 = nn.InstanceNorm3d(embed_dim)
+        self.norm2 = nn.InstanceNorm3d(embed_dim)
+
+        self.to_qkv = nn.Conv3d(embed_dim, embed_dim * 3, 1)
+        self.proj = nn.Conv3d(embed_dim, embed_dim, 1)
+        self.proj_dropout = nn.Dropout(dropout)
+
+        self.qnorm = nn.LayerNorm(embed_dim // num_heads)
+        self.knorm = nn.LayerNorm(embed_dim // num_heads)
+
+        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+
+        self.reattention = reattention
+
+        if reattention:
+            self.reattn_weight = nn.Parameter(torch.randn(num_heads, num_heads))
+            self.reattn_norm = nn.Sequential(
+                Rearrange("b h i j -> b i j h"),
+                Lambda(lambda x: x.contiguous()),
+                nn.LayerNorm(num_heads),
+                Rearrange("b i j h -> b h i j"),
+                Lambda(lambda x: x.contiguous()),
+            )
+            self.v_ones = None
+
+    def scaled_dot_product_reattention(
+        self,
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+    ):
+        B, H, N, C = query.shape
+        if self.v_ones is None or self.v_ones.shape[1] != N:
+            self.v_ones = (
+                torch.ones((N, N))
+                .expand(H, N, N)
+                .to(device=query.device, dtype=query.dtype)
+            )
+
+        attn_weight = F.scaled_dot_product_attention(
+            query,
+            key,
+            self.v_ones.expand(B, H, N, N),
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal,
+            scale=scale,
         )
-        self.norm = nn.InstanceNorm3d(embed_dim)
+
+        attn_weight = einsum(attn_weight, self.reattn_weight, "b h i j, h g -> b g i j")
+        attn_weight = self.reattn_norm(attn_weight)
+
+        return attn_weight @ value
 
     def forward(self, x):
-        n_sd = x.ndim - 2
-        sizes = dict(zip(["b", "c", "h", "w", "d"], x.shape))
+        b, c, h, w, d = x.shape
+        he = self.num_heads
 
-        x = rearrange(x, "b c h w d -> (b w d) h c", **sizes)
-        attn_h = self.attn(x)
-        attn_h = rearrange(attn_h, "(b w d) h c -> b c h w d", **sizes)
+        x = self.norm1(x)
+        qkv = self.to_qkv(x).chunk(3, dim=1)  # b c h w d -> b 3c h w d -> 3 b c h w d
+        q, k, v = map(
+            lambda x: rearrange(x, "b (he c) h w d -> b he h w d c", he=he).contiguous(), qkv
+        )  # where channels C = dims D * heads H
 
-        if n_sd > 1 and sizes["w"] > 1:
-            x = rearrange(x, "(b w d) h c -> (b h d) w c", **sizes)
-            attn_w = self.attn(x)
-            attn_w = rearrange(attn_w, "(b h d) w c -> b c h w d", **sizes)
+        q = self.qnorm(q)
+        k = self.knorm(k)
+
+        q, k = self.rope.rotate_queries_and_keys(q, k)
+
+        # Scale dot product attention, attend over T dim (2nd last)
+        if self.reattention:
+            attn_fn = self.scaled_dot_product_reattention
         else:
-            attn_w = 0.0
+            attn_fn = F.scaled_dot_product_attention
 
-        if n_sd > 2 and sizes["d"] > 1:
-            x = rearrange(x, "(b h d) w c -> (b h w) d c", **sizes)
-            attn_d = self.attn(x)
-            attn_d = rearrange(attn_d, "(b h w) d c -> b c h w d", **sizes)
-        else:
-            attn_d = 0.0
+        qh, kh, vh = map(
+            lambda x: rearrange(x, "b he h w d c -> (b w d) he h c").contiguous(), (q, k, v)
+        )
+        yh = attn_fn(
+            qh, kh, vh, dropout_p=self.dropout if self.training else 0.0
+        ) 
+        yh = rearrange(yh, "(b w d) he h c -> b (he c) h w d", he=he, h=h, w=w, d=d).contiguous()
 
-        out = (attn_h + attn_w + attn_d) / 3
-        return self.norm(out)
+        qw, kw, vw = map(
+            lambda x: rearrange(x, "b he h w d c -> (b h d) he w c").contiguous(), (q, k, v)
+        )
+        yw = attn_fn(
+            qw, kw, vw, dropout_p=self.dropout if self.training else 0.0
+        )
+        yw = rearrange(yw, "(b h d) he w c -> b (he c) h w d", he=he, h=h, w=w, d=d).contiguous()
+
+        qd, kd, vd = map(
+            lambda x: rearrange(x, "b he h w d c -> (b h w) he d c").contiguous(), (q, k, v)
+        )
+        yd = attn_fn(
+            qd, kd, vd, dropout_p=self.dropout if self.training else 0.0
+        )
+        yd = rearrange(yd, "(b h w) he d c -> b (he c) h w d", he=he, h=h, w=w, d=d).contiguous()
+
+        y = (yh + yw + yd) / 3
+
+        y = self.norm2(y)
+
+        # output linear projection
+        y = self.proj(y)
+        y = self.proj_dropout(y)
+
+        return y
 
 
 class TransformerBlock(nn.Module):
