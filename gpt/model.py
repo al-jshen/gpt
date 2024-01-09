@@ -9,8 +9,6 @@ from functools import cached_property
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 from lightning.pytorch.strategies import DeepSpeedStrategy
 from gpt.utils import patchify
-from gpt.dtn import DTN
-from gpt.lff import LocalityFeedForward
 from rotary_embedding_torch import RotaryEmbedding
 
 
@@ -65,8 +63,10 @@ class Attention(nn.Module):
             self.reattn_weight = nn.Parameter(torch.randn(num_heads, num_heads))
             self.reattn_norm = nn.Sequential(
                 Rearrange("b h i j -> b i j h"),
+                Lambda(lambda x: x.contiguous()),
                 nn.LayerNorm(num_heads),
                 Rearrange("b i j h -> b h i j"),
+                Lambda(lambda x: x.contiguous()),
             )
             self.v_ones = None
 
@@ -110,7 +110,7 @@ class Attention(nn.Module):
         # Self-attention
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # b n c -> b n 3c -> 3 b n c
         q, k, v = map(
-            lambda x: rearrange(x, "b n (he d) -> b he n d", he=H), qkv
+            lambda x: rearrange(x, "b n (he d) -> b he n d", he=H).contiguous(), qkv
         )  # where channels C = dims D * heads H
 
         q = self.qnorm(q)
@@ -130,7 +130,7 @@ class Attention(nn.Module):
             )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
 
         # Project back to embedding dimension
-        y = rearrange(y, "b h t d -> b t (h d)")
+        y = rearrange(y, "b h t d -> b t (h d)").contiguous()
 
         # output projection
         y = self.proj(y)
@@ -165,12 +165,9 @@ class hMLP_stem(nn.Module):
         patch_size=(16, 16, 16),
         in_chans=3,
         embed_dim=768,
-        spatial_dims=3,
     ):
         super().__init__()
-        assert (
-            len(patch_size) == spatial_dims
-        ), "Must have one patch size for each spatial dimension"
+        spatial_dims = len(patch_size)
         self.kernel_sizes = build_kernel_size(patch_size)
         self.patch_size = patch_size
         self.spatial_dims = spatial_dims
@@ -224,12 +221,9 @@ class hMLP_output(nn.Module):
         embed_dim=768,
         out_chans=3,
         patch_size=(16, 16, 16),
-        spatial_dims=3,
     ):
         super().__init__()
-        assert (
-            len(patch_size) == spatial_dims
-        ), "Must have one patch size for each spatial dimension"
+        spatial_dims = len(patch_size)
         self.kernel_sizes = build_kernel_size(patch_size)
         self.patch_size = patch_size
         self.spatial_dims = spatial_dims
@@ -333,7 +327,7 @@ class DebedHead(nn.Module):
             "b (nh nw) c -> b c nh nw",
             nh=self.num_patches[0],
             nw=self.num_patches[1],
-        )  # (b, embed_dim, nh, nw)
+        ).contiguous()  # (b, embed_dim, nh, nw)
         x = self.debed(x)
         return x
 
@@ -389,7 +383,9 @@ class ConvolutionalSpatialGatingUnit(torch.nn.Module):
         x_r, x_g = x.chunk(2, dim=-1)
 
         x_g = self.norm(x_g)  # (N, T, D/2)
-        x_g = self.dwconv(x_g.transpose(1, 2)).transpose(1, 2)  # (N, T, D/2)
+        x_g = (
+            self.dwconv(x_g.transpose(1, 2)).transpose(1, 2).contiguous()
+        )  # (N, T, D/2)
         if self.linear is not None:
             x_g = self.linear(x_g)
         out = x_r * x_g  # (N, T, D/2)
@@ -429,6 +425,43 @@ class ConvolutionalGatingMLP(torch.nn.Module):
         return x
 
 
+class AxialAttention(nn.Module):
+    def __init__(self, embed_dim=256, num_heads=8, dropout=0.1, reattention=True):
+        super().__init__()
+        self.attn = Attention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            reattention=reattention,
+        )
+        self.norm = nn.InstanceNorm3d(embed_dim)
+
+    def forward(self, x):
+        n_sd = x.ndim - 2
+        sizes = dict(zip(["b", "c", "h", "w", "d"], x.shape))
+
+        x = rearrange(x, "b c h w d -> (b w d) h c", **sizes)
+        attn_h = self.attn(x)
+        attn_h = rearrange(attn_h, "(b w d) h c -> b c h w d", **sizes)
+
+        if n_sd > 1 and sizes["w"] > 1:
+            x = rearrange(x, "(b w d) h c -> (b h d) w c", **sizes)
+            attn_w = self.attn(x)
+            attn_w = rearrange(attn_w, "(b h d) w c -> b c h w d", **sizes)
+        else:
+            attn_w = 0.0
+
+        if n_sd > 2 and sizes["d"] > 1:
+            x = rearrange(x, "(b h d) w c -> (b h w) d c", **sizes)
+            attn_d = self.attn(x)
+            attn_d = rearrange(attn_d, "(b h w) d c -> b c h w d", **sizes)
+        else:
+            attn_d = 0.0
+
+        out = (attn_h + attn_w + attn_d) / 3
+        return self.norm(out)
+
+
 class TransformerBlock(nn.Module):
     """Transformer block.
 
@@ -452,8 +485,10 @@ class TransformerBlock(nn.Module):
         parallel_paths=2,
         layer_scale=1e-2,
         reattention=True,
+        axial_3d=False,
     ):
         super().__init__()
+        self.axial_3d = axial_3d
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
         self.ln3 = nn.LayerNorm(embed_dim)
@@ -463,6 +498,13 @@ class TransformerBlock(nn.Module):
         self.attns = Parallel(
             [
                 Attention(
+                    num_heads=num_heads,
+                    embed_dim=embed_dim,
+                    dropout=dropout,
+                    reattention=reattention,
+                )
+                if not axial_3d
+                else AxialAttention(
                     num_heads=num_heads,
                     embed_dim=embed_dim,
                     dropout=dropout,
@@ -502,24 +544,69 @@ class TransformerBlock(nn.Module):
         self.proj = nn.Linear(embed_dim * 2, embed_dim)
         self.drop_path = DropPath(dropout)
 
+    def channel_last(self, fn, x):
+        x = rearrange(x, "b c ... -> b ... c")
+        x = fn(x)
+        x = rearrange(x, "b ... c -> b c ...")
+        return x
+
     def forward(self, x):
-        # x has shape (batch, sequence_length, embed_dim)
-        x = self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
-        x1 = x2 = x  # split branches
-        x1 = (
-            x1
-            + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
-            + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
-        )
-        x2 = x2 + self.drop_path(self.ls3[None, None, :] * self.cgmlps(self.ln3(x2)))
-        x_out = torch.cat((x1, x2), dim=-1)  # (batch, sequence_length, embed_dim * 2)
-        # e-branchformer style merge
-        x_out = (
-            self.dwconv(x_out.transpose(1, 2)).transpose(1, 2) + x_out
-        )  # (batch, sequence_length, embed_dim * 2)
-        x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
-        x_out = self.mlp2(x_out) + x_out
-        return x_out
+        if not self.axial_3d:
+            # x has shape (batch, sequence_length, embed_dim)
+            x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
+            x1 = x2 = x  # split branches
+            x1 = (
+                x1
+                + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+                + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
+            )
+            x2 = x2 + self.drop_path(
+                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
+            )
+            x_out = torch.cat(
+                (x1, x2), dim=-1
+            )  # (batch, sequence_length, embed_dim * 2)
+            # e-branchformer style merge
+            x_out = (
+                self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
+            )  # (batch, sequence_length, embed_dim * 2)
+            x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
+            x_out = 0.5 * self.mlp2(x_out) + x_out
+            return x_out
+        if self.axial_3d:
+            b, c, h, w, d = x.shape
+            x = rearrange(x, "b c h w d -> b (h w d) c")
+            x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
+            x1 = x2 = x  # split branches
+            x1 = (
+                x1
+                + self.drop_path(
+                    self.ls1[None, None, :]
+                    * rearrange(
+                        self.attns(
+                            rearrange(
+                                self.ln1(x1), "b (h w d) c -> b c h w d", h=h, w=w, d=d
+                            ).contiguous()
+                        ),
+                        "b c h w d -> b (h w d) c",
+                    ).contiguous()
+                )
+                + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
+            )
+            x2 = x2 + self.drop_path(
+                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
+            )
+            x_out = torch.cat(
+                (x1, x2), dim=-1
+            )  # (batch, sequence_length, embed_dim * 2)
+            # e-branchformer style merge
+            x_out = (
+                self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
+            )  # (batch, sequence_length, embed_dim * 2)
+            x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
+            x_out = 0.5 * self.mlp2(x_out) + x_out
+            x_out = rearrange(x_out, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
+            return x_out
 
 
 class PEG(nn.Module):
@@ -543,12 +630,12 @@ class PEG(nn.Module):
         self.stride = stride
 
     def forward(self, x, H, W, D):
-        cnn_feat = rearrange(x, "b (h w d) c -> b c h w d", h=H, w=W, d=D)
+        cnn_feat = rearrange(x, "b (h w d) c -> b c h w d", h=H, w=W, d=D).contiguous()
         if self.stride == 1:
             out = self.proj(cnn_feat) + cnn_feat
         else:
             out = self.proj(cnn_feat)
-        out = rearrange(out, "b c h w d -> b (h w d) c")
+        out = rearrange(out, "b c h w d -> b (h w d) c").contiguous()
         return out
 
 
@@ -658,7 +745,9 @@ class ViT(nn.Module):
         # embed patches
         x = self.patch_embed(x)  # (b, embed_dim, nh, nw)
 
-        x = rearrange(x, "b c h w -> b (h w) c")  # (b, n_patches, embed_dim)
+        x = rearrange(
+            x, "b c h w -> b (h w) c"
+        ).contiguous()  # (b, n_patches, embed_dim)
 
         # # add positional encoding and do dropout
         # x = self.dropout(
@@ -746,7 +835,9 @@ class MAE(nn.Module):
 
         tokens = self.vit.patch_embed(x)  # (b embed_dim, nh, nw)
 
-        tokens = rearrange(tokens, "b c h w -> b (h w) c")  # (b n_patches embed_dim)
+        tokens = rearrange(
+            tokens, "b c h w -> b (h w) c"
+        ).contiguous()  # (b n_patches embed_dim)
 
         n_patches = tokens.shape[1]
 
