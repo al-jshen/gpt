@@ -1,10 +1,10 @@
 [config]
-dataset = "imagenet" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
+dataset = "cifar10" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
 model = "vit" # [vit]
-embed_dim = 512
-mlp_ratio = 4
+embed_dim = 384
+mlp_ratio = 2
 conv_kernel_size = 31
-num_blocks = 8
+num_blocks = 4
 num_heads = 8
 reattention = true
 parallel_paths = 2
@@ -14,21 +14,22 @@ task = "classification" # [classification, reconstruction, mae]
 decoder_num_blocks = 1
 masking_fraction = 0.75
 strategy = "ddp" # [ddp, fsdp, ddp_find_unused_parameters_true, deepspeed_stage_x, deepspeed_stage_x_offload]
-epochs = 100
+epochs = 50
 limit_data_fraction = 1.0
 accelerator = "gpu"
 gpus = 2
-# load_ckpt = "/mnt/home/jshen/ceph/programs/gpt/train/lightning_logs/version_22/checkpoints/epoch=22-step=21574.ckpt"
+nodes = 1
+# load_ckpt = "/scratch/gpfs/js5013/programs/gpt/train/lightning_logs/version_22/checkpoints/epoch=22-step=21574.ckpt"
 # load_ckpt = ""
-data_dir = "/mnt/home/jshen/ceph/data/ml/"
+data_dir = "/scratch/gpfs/js5013/data/ml/"
 train = true
 nshot = 0 # 0 for full training data
 compile = false
-wandb_track = true
+wandb_track = false
 wandb_entity = "j_shen"
 wandb_project = "gpt"
-wandb_group = "imagenet"
+wandb_group = "cifar10"
 wandb_notes = "initial long classification test"
 wandb_offline = false
-wandb_save_dir = "/mnt/home/jshen/ceph/programs/gpt/train/"
+wandb_save_dir = "/scratch/gpfs/js5013/programs/gpt/train/"
 wandb_key = "8b68006c061aeb7ad95f4dbdcc8bb2699f0c1da9"

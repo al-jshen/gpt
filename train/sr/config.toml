@@ -1,0 +1,18 @@
+[model]
+hidden_dims = [64, 128]
+patch_size = [2, 1, 2]
+upsample_factor = 2 
+num_heads = 8
+
+[train]
+nodes = 1
+gpus = 1
+precision = 'bf16-mixed'
+strategy = 'ddp'
+epochs = 10
+batch_size = 1
+num_workers = 8
+
+[data]
+dir = '/scratch/gpfs/js5013/data/foundation/rsg/3D/merged/'
+n_fields = 2

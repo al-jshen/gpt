@@ -153,6 +153,18 @@ def setup(args):
 
     else:
         if args.model == "vit":
+            output_head = (
+                ClassificationHead(args.embed_dim, output_dim)
+                if args.task == "classification"
+                else DebedHead(
+                    args.embed_dim,
+                    datamodule.image_channels,
+                    datamodule.image_size,
+                    patch_size,
+                )
+                if args.task == "reconstruction"
+                else None
+            )
             model = LightningWrapper(
                 ViT,
                 patch_size=patch_size,
@@ -165,17 +177,8 @@ def setup(args):
                 reattention=args.reattention,
                 parallel_paths=args.parallel_paths,
                 dropout=0.1,
+                output_head=output_head,
                 lr=1e-3,
-                output_head=ClassificationHead(args.embed_dim, output_dim)
-                if args.task == "classification"
-                else DebedHead(
-                    args.embed_dim,
-                    datamodule.image_channels,
-                    datamodule.image_size,
-                    patch_size,
-                )
-                if args.task == "reconstruction"
-                else None,
                 loss_fn=F.cross_entropy
                 if args.task == "classification"
                 else F.mse_loss,
@@ -253,6 +256,7 @@ def train(model, datamodule, args):
         trainer = pl.Trainer(
             accelerator=args.accelerator,
             devices=args.gpus,
+            num_nodes=args.nodes,
             strategy=args.strategy,
             precision=args.precision,
             # gradient_clip_val=1.0 if args.strategy != "fsdp" else None,
