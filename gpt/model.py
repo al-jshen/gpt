@@ -426,15 +426,15 @@ class ConvolutionalGatingMLP(torch.nn.Module):
 
 
 class AxialAttention(nn.Module):
-    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1, reattention=False):
+    def __init__(self, embed_dim=768, num_heads=12, dropout=0.1, reattention=False):
         super().__init__()
 
         assert (
             embed_dim % num_heads == 0
         ), "Embedding dimension must be divisible by number of heads"
 
-        self.num_heads = num_heads
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
         self.dropout = dropout
 
         self.norm1 = nn.InstanceNorm3d(embed_dim)
@@ -502,7 +502,10 @@ class AxialAttention(nn.Module):
         x = self.norm1(x)
         qkv = self.to_qkv(x).chunk(3, dim=1)  # b c h w d -> b 3c h w d -> 3 b c h w d
         q, k, v = map(
-            lambda x: rearrange(x, "b (he c) h w d -> b he h w d c", he=he).contiguous(), qkv
+            lambda x: rearrange(
+                x, "b (he c) h w d -> b he h w d c", he=he
+            ).contiguous(),
+            qkv,
         )  # where channels C = dims D * heads H
 
         q = self.qnorm(q)
@@ -517,28 +520,31 @@ class AxialAttention(nn.Module):
             attn_fn = F.scaled_dot_product_attention
 
         qh, kh, vh = map(
-            lambda x: rearrange(x, "b he h w d c -> (b w d) he h c").contiguous(), (q, k, v)
+            lambda x: rearrange(x, "b he h w d c -> (b w d) he h c").contiguous(),
+            (q, k, v),
         )
-        yh = attn_fn(
-            qh, kh, vh, dropout_p=self.dropout if self.training else 0.0
-        ) 
-        yh = rearrange(yh, "(b w d) he h c -> b (he c) h w d", he=he, h=h, w=w, d=d).contiguous()
+        yh = attn_fn(qh, kh, vh, dropout_p=self.dropout if self.training else 0.0)
+        yh = rearrange(
+            yh, "(b w d) he h c -> b (he c) h w d", he=he, h=h, w=w, d=d
+        ).contiguous()
 
         qw, kw, vw = map(
-            lambda x: rearrange(x, "b he h w d c -> (b h d) he w c").contiguous(), (q, k, v)
+            lambda x: rearrange(x, "b he h w d c -> (b h d) he w c").contiguous(),
+            (q, k, v),
         )
-        yw = attn_fn(
-            qw, kw, vw, dropout_p=self.dropout if self.training else 0.0
-        )
-        yw = rearrange(yw, "(b h d) he w c -> b (he c) h w d", he=he, h=h, w=w, d=d).contiguous()
+        yw = attn_fn(qw, kw, vw, dropout_p=self.dropout if self.training else 0.0)
+        yw = rearrange(
+            yw, "(b h d) he w c -> b (he c) h w d", he=he, h=h, w=w, d=d
+        ).contiguous()
 
         qd, kd, vd = map(
-            lambda x: rearrange(x, "b he h w d c -> (b h w) he d c").contiguous(), (q, k, v)
+            lambda x: rearrange(x, "b he h w d c -> (b h w) he d c").contiguous(),
+            (q, k, v),
         )
-        yd = attn_fn(
-            qd, kd, vd, dropout_p=self.dropout if self.training else 0.0
-        )
-        yd = rearrange(yd, "(b h w) he d c -> b (he c) h w d", he=he, h=h, w=w, d=d).contiguous()
+        yd = attn_fn(qd, kd, vd, dropout_p=self.dropout if self.training else 0.0)
+        yd = rearrange(
+            yd, "(b h w) he d c -> b (he c) h w d", he=he, h=h, w=w, d=d
+        ).contiguous()
 
         y = (yh + yw + yd) / 3
 
