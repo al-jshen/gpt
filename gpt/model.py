@@ -318,7 +318,7 @@ class DebedHead(nn.Module):
             embed_dim=in_channels,
             out_chans=out_channels,
             patch_size=patch_size,
-            spatial_dims=self.spatial_dims,
+            # spatial_dims=self.spatial_dims,
         )
 
     def forward(self, x):
@@ -795,7 +795,7 @@ class ViT(nn.Module):
             patch_size=patch_size,
             in_chans=embed_dim // 4,
             embed_dim=embed_dim,
-            spatial_dims=self.spatial_dims,
+            # spatial_dims=self.spatial_dims,
         )
 
         # self.positional_encoding = nn.Parameter(
