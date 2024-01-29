@@ -568,7 +568,6 @@ class TransformerBlock(nn.Module):
     - parallel layers (https://arxiv.org/abs/2203.09795)
     - rotary positional encoding (https://arxiv.org/pdf/2104.09864.pdf)
     - drop path (https://arxiv.org/pdf/2106.09681.pdf)
-    - res-post-norm (https://arxiv.org/abs/2111.09883)
     """
 
     def __init__(
@@ -653,11 +652,11 @@ class TransformerBlock(nn.Module):
             x1 = x2 = x  # split branches
             x1 = (
                 x1
-                + self.drop_path(self.ls1[None, None, :] * self.ln1(self.attns(x1)))
-                + self.drop_path(self.ls2[None, None, :] * self.ln2(self.mlps(x1)))
+                + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+                + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
             )
             x2 = x2 + self.drop_path(
-                self.ls3[None, None, :] * self.ln3(self.cgmlps(x2))
+                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
             )
             x_out = torch.cat(
                 (x1, x2), dim=-1
@@ -679,20 +678,18 @@ class TransformerBlock(nn.Module):
                 + self.drop_path(
                     self.ls1[None, None, :]
                     * rearrange(
-                        self.ln1(
-                            self.attns(
-                                rearrange(
-                                    x1, "b (h w d) c -> b c h w d", h=h, w=w, d=d
-                                ).contiguous()
-                            )
+                        self.attns(
+                            rearrange(
+                                self.ln1(x1), "b (h w d) c -> b c h w d", h=h, w=w, d=d
+                            ).contiguous()
                         ),
                         "b c h w d -> b (h w d) c",
                     ).contiguous()
                 )
-                + self.drop_path(self.ls2[None, None, :] * self.ln2(self.mlps(x1)))
+                + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
             )
             x2 = x2 + self.drop_path(
-                self.ls3[None, None, :] * self.ln3(self.cgmlps(x2))
+                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
             )
             x_out = torch.cat(
                 (x1, x2), dim=-1
