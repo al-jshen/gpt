@@ -100,6 +100,7 @@ class UNet(nn.Module):
         patch_size=(1, 1, 1),
         upsample_res=1,
         num_heads=4,
+        attention=True,
     ):
         super().__init__()
         self.in_dims = in_dims
@@ -110,13 +111,13 @@ class UNet(nn.Module):
 
         self.down = [
             UNetBlock(
-                in_dims, hidden_dims[0], patch_size=patch_size, num_heads=num_heads
+                in_dims, hidden_dims[0], patch_size=patch_size, num_heads=num_heads, attention=attention
             ),
             Downsample(hidden_dims[0]),
         ]
         for i in range(self.n_hidden - 1):
             self.down.append(
-                UNetBlock(hidden_dims[i], hidden_dims[i + 1], num_heads=num_heads)
+                UNetBlock(hidden_dims[i], hidden_dims[i + 1], num_heads=num_heads, attention=attention)
             )
             self.down.append(Downsample(hidden_dims[i + 1]))
         self.down = nn.ModuleList(self.down)
@@ -138,11 +139,12 @@ class UNet(nn.Module):
                     hidden_dims[self.n_hidden - i],
                     hidden_dims[self.n_hidden - (i + 1)],
                     num_heads=num_heads,
+                    attention=attention
                 )
             )
         self.up.append(Upsample(hidden_dims[0]))
         self.up.append(
-            UNetBlock(hidden_dims[0], in_dims, patch_size=patch_size, num_heads=in_dims)
+            UNetBlock(hidden_dims[0], in_dims, patch_size=patch_size, num_heads=in_dims, attention=attention)
         )
 
         self.up = nn.ModuleList(self.up)
