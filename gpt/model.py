@@ -1036,9 +1036,17 @@ class LightningWrapper(pl.LightningModule):
             if not k.startswith("inner_"):
                 setattr(self, k, v)
 
+        if hasattr(self, "loss_mod") and hasattr(self, "loss_fn"):
+            raise ValueError("cannot have both loss_mod and loss_fn")
+        elif hasattr(self, "loss_mod"):
+            assert hasattr(
+                self, "loss_mod_args"
+            ), "must have loss_mod_args if loss_mod is present"
+            self.loss_fn = self.loss_mod(**self.loss_mod_args)
+
         self.modelclass = modelclass
 
-        del_keys = ["lr", "loss_fn", "logging"]
+        del_keys = ["lr", "loss_fn", "loss_mod", "loss_mod_args", "logging"]
         inner_kwargs = {k: v for k, v in kwargs.items() if k not in del_keys}
 
         # build model
@@ -1050,8 +1058,8 @@ class LightningWrapper(pl.LightningModule):
         self.custom_step = hasattr(self.model, "step")
 
         assert (
-            self.custom_step or "loss_fn" in kwargs
-        ), "must have loss_fn or custom step (step method in modelclass)"
+            self.custom_step or "loss_fn" or "loss_mod" in kwargs
+        ), "must have loss_fn, loss_mod or custom step (step method in modelclass)"
         assert "lr" in kwargs, "must have lr"
 
     @property
