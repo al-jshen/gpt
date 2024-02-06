@@ -585,10 +585,10 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.axial_3d = axial_3d
         self.ln1 = nn.LayerNorm(embed_dim)
-        # self.ln2 = nn.LayerNorm(embed_dim)
+        self.ln2 = nn.LayerNorm(embed_dim)
         self.ln3 = nn.LayerNorm(embed_dim)
         self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
-        # self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
+        self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
         self.ls3 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
         self.attns = Parallel(
             [
@@ -608,12 +608,12 @@ class TransformerBlock(nn.Module):
                 for _ in range(parallel_paths)
             ]
         )
-        # self.mlps = Parallel(
-        #     [
-        #         MLP(embed_dim, embed_dim * mlp_ratio, dropout=dropout)
-        #         for _ in range(parallel_paths)
-        #     ]
-        # )
+        self.mlps = Parallel(
+            [
+                MLP(embed_dim, embed_dim * mlp_ratio, dropout=dropout)
+                for _ in range(parallel_paths)
+            ]
+        )
         self.cgmlps = Parallel(
             [
                 ConvolutionalGatingMLP(
@@ -650,10 +650,9 @@ class TransformerBlock(nn.Module):
             # x has shape (batch, sequence_length, embed_dim)
             x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
             x1 = x2 = x  # split branches
-            x1 = (
-                x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
-                # + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
-            )
+            x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+
+            x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
             x2 = x2 + self.drop_path(
                 self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
             )
