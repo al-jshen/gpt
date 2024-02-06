@@ -3,7 +3,7 @@ import torch
 import lightning.pytorch as pl
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, einsum, repeat
+from einops import rearrange, einsum, repeat, pack, unpack
 from einops.layers.torch import Rearrange
 from functools import cached_property
 from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -578,7 +578,7 @@ class TransformerBlock(nn.Module):
         conv_kernel_size=31,
         dropout=0.1,
         parallel_paths=2,
-        layer_scale=1e-2,
+        layer_scale=1e-5,
         reattention=True,
         axial_3d=False,
     ):
@@ -746,6 +746,7 @@ class ViT(nn.Module):
         image_channels=3,
         image_size = (256, 256),
         patch_size=(16, 16),
+        num_registers=4,
         reattention=True,
         output_head=None,
     ):
@@ -759,6 +760,7 @@ class ViT(nn.Module):
         self.image_channels = image_channels
         self.image_size = image_size
         self.patch_size = patch_size
+        self.num_registers = num_registers 
         self.spatial_dims = len(patch_size)
         assert len(patch_size) == self.spatial_dims
         self.n_patches: tuple[int, ...] = tuple(
@@ -803,6 +805,10 @@ class ViT(nn.Module):
         )
         # self.positional_encoding = PEG(embed_dim, embed_dim)
 
+        self.register_tokens = nn.Parameter(
+            torch.randn(num_registers, embed_dim)
+        )
+
         self.dropout = nn.Dropout(dropout)
 
         self.blocks = nn.Sequential(
@@ -826,11 +832,11 @@ class ViT(nn.Module):
         self.output_head = output_head
 
     def forward(self, x):
-        # B, C, H, W = x.shape
+        B, C, H, W = x.shape
 
-        n_patches = tuple(
-            [x.shape[2 + d] // self.patch_size[d] for d in range(self.spatial_dims)]
-        )
+        # n_patches = tuple(
+        #     [x.shape[2 + d] // self.patch_size[d] for d in range(self.spatial_dims)]
+        # )
 
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
@@ -850,8 +856,17 @@ class ViT(nn.Module):
             x + self.positional_encoding
         )  # (batch, n_patches, embed_dim)
 
+        # add register tokens
+        r = repeat(
+            self.register_tokens, "n d -> b n d", b=B
+        )
+
+        x, pack_info = pack([x, r], "b * d") # (batch, n_patches + n_registers, embed_dim)
+
         # pass through transformer blocks
         x = self.blocks(x)  # (batch, sequence_length, embed_dim)
+
+        x, _ = unpack(x, pack_info, "b * d")
 
         # # pass through first transformer block
         # x = self.blocks[0](x)
