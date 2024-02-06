@@ -740,7 +740,7 @@ class ViT(nn.Module):
         mlp_ratio=4,
         conv_kernel_size=31,
         num_heads=12,
-        dropout=0.1,
+        dropout=0.0,
         num_blocks=6,
         parallel_paths=2,
         image_channels=3,
@@ -905,8 +905,8 @@ class MAE(nn.Module):
         masking_fraction,
         decoder_dim=256,
         decoder_num_heads=8,
-        decoder_num_blocks=4,
-        decoder_dropout=0.1,
+        decoder_num_blocks=2,
+        decoder_dropout=0.0,
     ):
         super().__init__()
 
@@ -929,7 +929,7 @@ class MAE(nn.Module):
                     mlp_ratio=4,
                     dropout=decoder_dropout,
                     parallel_paths=2,
-                    layer_scale=0.1,
+                    layer_scale=1e-4,
                     reattention=True,
                 )
                 for _ in range(decoder_num_blocks)
@@ -952,8 +952,8 @@ class MAE(nn.Module):
 
         n_patches = tokens.shape[1]
 
-        # add PEG encoding
-        tokens = tokens + self.vit.positional_encoding(tokens, *self.vit.n_patches, 1)
+        # add positional encoding
+        tokens = tokens + self.vit.positional_encoding
 
         # make random indices to determine what gets mask/kept
         rand_idx = torch.rand(B, n_patches)
@@ -978,8 +978,10 @@ class MAE(nn.Module):
             batch_indexer, unmask_idx
         ]  # (batch, n_unmask, embed_dim)
 
-        # encode
+        # encode, adding register tokens
+        unmask_tokens, pack_info = pack([unmask_tokens, self.vit.register_tokens], "b * d")
         encoded_tokens = self.vit.blocks(unmask_tokens)  # (batch, n_unmask, embed_dim)
+        encoded_tokens, _ = unpack(encoded_tokens, pack_info, "b * d")
         encoded_tokens = self.vit.norm(unmask_tokens)  # (batch, n_unmask, embed_dim)
 
         # project to decoder dim
