@@ -56,7 +56,7 @@ class Attention(nn.Module):
         self.qnorm = nn.LayerNorm(embed_dim // num_heads)
         self.knorm = nn.LayerNorm(embed_dim // num_heads)
 
-        # self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
 
         self.reattention = reattention
         if reattention:
@@ -116,7 +116,7 @@ class Attention(nn.Module):
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        # q, k = self.rope.rotate_queries_and_keys(q, k)
+        q, k = self.rope.rotate_queries_and_keys(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -447,7 +447,7 @@ class AxialAttention(nn.Module):
         self.qnorm = nn.LayerNorm(embed_dim // num_heads)
         self.knorm = nn.LayerNorm(embed_dim // num_heads)
 
-        # self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
 
         self.reattention = reattention
 
@@ -511,7 +511,7 @@ class AxialAttention(nn.Module):
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        # q, k = self.rope.rotate_queries_and_keys(q, k)
+        q, k = self.rope.rotate_queries_and_keys(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -744,6 +744,7 @@ class ViT(nn.Module):
         num_blocks=6,
         parallel_paths=2,
         image_channels=3,
+        image_size = (256, 256),
         patch_size=(16, 16),
         reattention=True,
         output_head=None,
@@ -756,12 +757,13 @@ class ViT(nn.Module):
         self.num_blocks = num_blocks
         self.parallel_paths = parallel_paths
         self.image_channels = image_channels
+        self.image_size = image_size
         self.patch_size = patch_size
         self.spatial_dims = len(patch_size)
         assert len(patch_size) == self.spatial_dims
-        # self.n_patches: tuple[int, ...] = tuple(
-        #     [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
-        # )
+        self.n_patches: tuple[int, ...] = tuple(
+            [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
+        )
 
         # patch_dim = np.prod(patch_size) * image_channels
 
@@ -794,12 +796,12 @@ class ViT(nn.Module):
             # spatial_dims=self.spatial_dims,
         )
 
-        # self.positional_encoding = nn.Parameter(
-        #     torch.randn(
-        #         1, np.prod(self.n_patches), embed_dim
-        #     )  # extra dim at front for batch
-        # )
-        self.positional_encoding = PEG(embed_dim, embed_dim)
+        self.positional_encoding = nn.Parameter(
+            torch.randn(
+                1, np.prod(self.n_patches), embed_dim
+            )  # extra dim at front for batch
+        )
+        # self.positional_encoding = PEG(embed_dim, embed_dim)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -844,21 +846,21 @@ class ViT(nn.Module):
         ).contiguous()  # (b, n_patches, embed_dim)
 
         # # add positional encoding and do dropout
-        # x = self.dropout(
-        #     x + self.positional_encoding
-        # )  # (batch, n_patches, embed_dim)
+        x = self.dropout(
+            x + self.positional_encoding
+        )  # (batch, n_patches, embed_dim)
 
-        # # pass through transformer blocks
-        # x = self.blocks(x)  # (batch, sequence_length, embed_dim)
+        # pass through transformer blocks
+        x = self.blocks(x)  # (batch, sequence_length, embed_dim)
 
-        # pass through first transformer block
-        x = self.blocks[0](x)
+        # # pass through first transformer block
+        # x = self.blocks[0](x)
 
-        # add PEG encoding
-        x = x + self.positional_encoding(x, *n_patches, 1)
+        # # # add PEG encoding
+        # # x = x + self.positional_encoding(x, *n_patches, 1)
 
-        # pass through remaining transformer blocks
-        x = self.blocks[1:](x)
+        # # pass through remaining transformer blocks
+        # x = self.blocks[1:](x)
 
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
