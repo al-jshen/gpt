@@ -56,7 +56,7 @@ class Attention(nn.Module):
         self.qnorm = nn.LayerNorm(embed_dim // num_heads)
         self.knorm = nn.LayerNorm(embed_dim // num_heads)
 
-        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+        # self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
 
         self.reattention = reattention
         if reattention:
@@ -116,7 +116,7 @@ class Attention(nn.Module):
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        q, k = self.rope.rotate_queries_and_keys(q, k)
+        # q, k = self.rope.rotate_queries_and_keys(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -447,7 +447,7 @@ class AxialAttention(nn.Module):
         self.qnorm = nn.LayerNorm(embed_dim // num_heads)
         self.knorm = nn.LayerNorm(embed_dim // num_heads)
 
-        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+        # self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
 
         self.reattention = reattention
 
@@ -511,7 +511,7 @@ class AxialAttention(nn.Module):
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        q, k = self.rope.rotate_queries_and_keys(q, k)
+        # q, k = self.rope.rotate_queries_and_keys(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
