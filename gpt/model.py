@@ -744,7 +744,7 @@ class ViT(nn.Module):
         num_blocks=6,
         parallel_paths=2,
         image_channels=3,
-        image_size = (256, 256),
+        image_size=(256, 256),
         patch_size=(16, 16),
         num_registers=4,
         reattention=True,
@@ -760,7 +760,7 @@ class ViT(nn.Module):
         self.image_channels = image_channels
         self.image_size = image_size
         self.patch_size = patch_size
-        self.num_registers = num_registers 
+        self.num_registers = num_registers
         self.spatial_dims = len(patch_size)
         assert len(patch_size) == self.spatial_dims
         self.n_patches: tuple[int, ...] = tuple(
@@ -805,9 +805,7 @@ class ViT(nn.Module):
         )
         # self.positional_encoding = PEG(embed_dim, embed_dim)
 
-        self.register_tokens = nn.Parameter(
-            torch.randn(num_registers, embed_dim)
-        )
+        self.register_tokens = nn.Parameter(torch.randn(num_registers, embed_dim))
 
         self.dropout = nn.Dropout(dropout)
 
@@ -852,16 +850,14 @@ class ViT(nn.Module):
         ).contiguous()  # (b, n_patches, embed_dim)
 
         # # add positional encoding and do dropout
-        x = self.dropout(
-            x + self.positional_encoding
-        )  # (batch, n_patches, embed_dim)
+        x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
 
         # add register tokens
-        r = repeat(
-            self.register_tokens, "n d -> b n d", b=B
-        )
+        r = repeat(self.register_tokens, "n d -> b n d", b=B)
 
-        x, pack_info = pack([x, r], "b * d") # (batch, n_patches + n_registers, embed_dim)
+        x, pack_info = pack(
+            [x, r], "b * d"
+        )  # (batch, n_patches + n_registers, embed_dim)
 
         # pass through transformer blocks
         x = self.blocks(x)  # (batch, sequence_length, embed_dim)
@@ -979,7 +975,9 @@ class MAE(nn.Module):
         ]  # (batch, n_unmask, embed_dim)
 
         # encode, adding register tokens
-        unmask_tokens, pack_info = pack([unmask_tokens, self.vit.register_tokens], "b * d")
+        unmask_tokens, pack_info = pack(
+            [unmask_tokens, self.vit.register_tokens], "b * d"
+        )
         encoded_tokens = self.vit.blocks(unmask_tokens)  # (batch, n_unmask, embed_dim)
         encoded_tokens, _ = unpack(encoded_tokens, pack_info, "b * d")
         encoded_tokens = self.vit.norm(unmask_tokens)  # (batch, n_unmask, embed_dim)
@@ -1149,3 +1147,16 @@ class LightningWrapper(pl.LightningModule):
             "strict": True,
         }
         return [optimizer], [scheduler]
+
+    def setup(self, stage):
+        match stage:
+            case "fit":
+                dataloader = self.trainer.datamodule.train_dataloader()
+            case "validate":
+                dataloader = self.trainer.datamodule.val_dataloader()
+            case "test":
+                dataloader = self.trainer.datamodule.test_dataloader()
+            case "predict":
+                dataloader = self.trainer.datamodule.predict_dataloader()
+        dummy_batch = next(iter(dataloader))
+        self._step(dummy_batch, None)
