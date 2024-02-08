@@ -1096,29 +1096,40 @@ class LightningWrapper(pl.LightningModule):
 
     def _log(self, log_name, loss):
         if self.logging:
-            self.log(
-                log_name,
-                loss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-            )
+            if not isinstance(loss, dict):
+                self.log(
+                    log_name,
+                    loss,
+                    prog_bar=True,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
+            else:
+                log_dict = {f"{log_name}_{k}": v for k, v in loss.items()}
+                self.log_dict(
+                    log_dict,
+                    prog_bar=True,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                )
 
     def training_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx)
-        self._log("train_loss", loss)
+        self._log("train", loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx)
-        self._log("val_loss", loss)
+        self._log("val", loss)
         return loss
 
     def testing_step(self, batch, batch_idx):
         loss = self._step(batch, batch_idx)
-        self._log("test_loss", loss)
+        self._log("test", loss)
         return loss
 
     @property
@@ -1147,16 +1158,3 @@ class LightningWrapper(pl.LightningModule):
             "strict": True,
         }
         return [optimizer], [scheduler]
-
-    def setup(self, stage):
-        match stage:
-            case "fit":
-                dataloader = self.trainer.datamodule.train_dataloader()
-            case "validate":
-                dataloader = self.trainer.datamodule.val_dataloader()
-            case "test":
-                dataloader = self.trainer.datamodule.test_dataloader()
-            case "predict":
-                dataloader = self.trainer.datamodule.predict_dataloader()
-        dummy_batch = next(iter(dataloader))
-        self._step(dummy_batch, None)
