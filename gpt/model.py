@@ -1098,7 +1098,7 @@ class LightningWrapper(pl.LightningModule):
         if self.logging:
             if not isinstance(loss, dict):
                 self.log(
-                    log_name,
+                    f"{log_name}_loss",
                     loss,
                     prog_bar=True,
                     logger=True,
