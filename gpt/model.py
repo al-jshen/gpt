@@ -1105,7 +1105,9 @@ class LightningWrapper(pl.LightningModule):
                     on_step=True,
                     on_epoch=True,
                     sync_dist=True,
+                    rank_zero_only=True,
                 )
+                return loss
             else:
                 log_dict = {f"{log_name}_{k}": v for k, v in loss.items()}
                 self.log_dict(
@@ -1115,21 +1117,23 @@ class LightningWrapper(pl.LightningModule):
                     on_step=True,
                     on_epoch=True,
                     sync_dist=True,
+                    rank_zero_only=True,
                 )
+                return log_dict[f"{log_name}_loss"]
 
     def training_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("train", loss)
+        loss_aux = self._step(batch, batch_idx)
+        loss = self._log("train", loss_aux)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("val", loss)
+        loss_aux = self._step(batch, batch_idx)
+        loss = self._log("val", loss_aux)
         return loss
 
     def testing_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("test", loss)
+        loss_aux = self._step(batch, batch_idx)
+        loss = self._log("test", loss_aux)
         return loss
 
     @property
