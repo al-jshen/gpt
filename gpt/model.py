@@ -1,13 +1,15 @@
+from functools import cached_property
+
+from einops import einsum, rearrange, repeat
+from einops.layers.torch import Rearrange
+import lightning.pytorch as pl
+from lightning.pytorch.strategies import DeepSpeedStrategy
 import numpy as np
 import torch
-import lightning.pytorch as pl
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, einsum, repeat
-from einops.layers.torch import Rearrange
-from functools import cached_property
+
 from deepspeed.ops.adam import DeepSpeedCPUAdam
-from lightning.pytorch.strategies import DeepSpeedStrategy
 from gpt.utils import patchify
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -1107,11 +1109,14 @@ class LightningWrapper(pl.LightningModule):
 
     def configure_optimizers(self):
         if self.deepspeed_offload:
-            optimizer = DeepSpeedCPUAdam(self.parameters(), lr=self.lr)
+            optimizer = DeepSpeedCPUAdam(
+                self.parameters(), lr=self.lr, weight_decay=0.1
+            )
         else:
             optimizer = torch.optim.AdamW(
                 self.parameters(),
                 lr=self.lr,
+                weight_decay=0.1,
             )
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=100, T_mult=1, eta_min=1e-6
