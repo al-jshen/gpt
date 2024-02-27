@@ -1,6 +1,9 @@
 from functools import cached_property
+from functools import cached_property
 
 from einops import einsum, rearrange, repeat
+from einops import einsum, pack, rearrange, repeat, unpack
+from einops.layers.torch import Rearrange
 from einops.layers.torch import Rearrange
 import lightning.pytorch as pl
 from lightning.pytorch.strategies import DeepSpeedStrategy
@@ -580,7 +583,7 @@ class TransformerBlock(nn.Module):
         conv_kernel_size=31,
         dropout=0.1,
         parallel_paths=2,
-        layer_scale=1e-2,
+        layer_scale=1e-5,
         reattention=True,
         axial_3d=False,
     ):
@@ -652,11 +655,9 @@ class TransformerBlock(nn.Module):
             # x has shape (batch, sequence_length, embed_dim)
             x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
             x1 = x2 = x  # split branches
-            x1 = (
-                x1
-                + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
-                + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
-            )
+            x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+
+            x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
             x2 = x2 + self.drop_path(
                 self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
             )
@@ -670,6 +671,7 @@ class TransformerBlock(nn.Module):
             x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
             x_out = 0.5 * self.mlp2(x_out) + x_out
             return x_out
+
         if self.axial_3d:
             b, c, h, w, d = x.shape
             x = rearrange(x, "b c h w d -> b (h w d) c")
@@ -688,7 +690,7 @@ class TransformerBlock(nn.Module):
                         "b c h w d -> b (h w d) c",
                     ).contiguous()
                 )
-                + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
+                # + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
             )
             x2 = x2 + self.drop_path(
                 self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
@@ -743,11 +745,13 @@ class ViT(nn.Module):
         mlp_ratio=4,
         conv_kernel_size=31,
         num_heads=12,
-        dropout=0.1,
+        dropout=0.0,
         num_blocks=6,
         parallel_paths=2,
         image_channels=3,
+        image_size=(256, 256),
         patch_size=(16, 16),
+        num_registers=4,
         reattention=True,
         output_head=None,
     ):
@@ -759,12 +763,14 @@ class ViT(nn.Module):
         self.num_blocks = num_blocks
         self.parallel_paths = parallel_paths
         self.image_channels = image_channels
+        self.image_size = image_size
         self.patch_size = patch_size
+        self.num_registers = num_registers
         self.spatial_dims = len(patch_size)
         assert len(patch_size) == self.spatial_dims
-        # self.n_patches: tuple[int, ...] = tuple(
-        #     [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
-        # )
+        self.n_patches: tuple[int, ...] = tuple(
+            [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
+        )
 
         # patch_dim = np.prod(patch_size) * image_channels
 
@@ -797,12 +803,14 @@ class ViT(nn.Module):
             # spatial_dims=self.spatial_dims,
         )
 
-        # self.positional_encoding = nn.Parameter(
-        #     torch.randn(
-        #         1, np.prod(self.n_patches), embed_dim
-        #     )  # extra dim at front for batch
-        # )
-        self.positional_encoding = PEG(embed_dim, embed_dim)
+        self.positional_encoding = nn.Parameter(
+            torch.randn(
+                1, np.prod(self.n_patches), embed_dim
+            )  # extra dim at front for batch
+        )
+        # self.positional_encoding = PEG(embed_dim, embed_dim)
+
+        self.register_tokens = nn.Parameter(torch.randn(num_registers, embed_dim))
 
         self.dropout = nn.Dropout(dropout)
 
@@ -827,11 +835,11 @@ class ViT(nn.Module):
         self.output_head = output_head
 
     def forward(self, x):
-        # B, C, H, W = x.shape
+        B, C, H, W = x.shape
 
-        n_patches = tuple(
-            [x.shape[2 + d] // self.patch_size[d] for d in range(self.spatial_dims)]
-        )
+        # n_patches = tuple(
+        #     [x.shape[2 + d] // self.patch_size[d] for d in range(self.spatial_dims)]
+        # )
 
         # # split into patches
         # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
@@ -847,21 +855,28 @@ class ViT(nn.Module):
         ).contiguous()  # (b, n_patches, embed_dim)
 
         # # add positional encoding and do dropout
-        # x = self.dropout(
-        #     x + self.positional_encoding
-        # )  # (batch, n_patches, embed_dim)
+        x = self.dropout(x + self.positional_encoding)  # (batch, n_patches, embed_dim)
 
-        # # pass through transformer blocks
-        # x = self.blocks(x)  # (batch, sequence_length, embed_dim)
+        # add register tokens
+        r = repeat(self.register_tokens, "n d -> b n d", b=B)
 
-        # pass through first transformer block
-        x = self.blocks[0](x)
+        x, pack_info = pack(
+            [x, r], "b * d"
+        )  # (batch, n_patches + n_registers, embed_dim)
 
-        # add PEG encoding
-        x = x + self.positional_encoding(x, *n_patches, 1)
+        # pass through transformer blocks
+        x = self.blocks(x)  # (batch, sequence_length, embed_dim)
 
-        # pass through remaining transformer blocks
-        x = self.blocks[1:](x)
+        x, _ = unpack(x, pack_info, "b * d")
+
+        # # pass through first transformer block
+        # x = self.blocks[0](x)
+
+        # # # add PEG encoding
+        # # x = x + self.positional_encoding(x, *n_patches, 1)
+
+        # # pass through remaining transformer blocks
+        # x = self.blocks[1:](x)
 
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
@@ -891,8 +906,8 @@ class MAE(nn.Module):
         masking_fraction,
         decoder_dim=256,
         decoder_num_heads=8,
-        decoder_num_blocks=4,
-        decoder_dropout=0.1,
+        decoder_num_blocks=2,
+        decoder_dropout=0.0,
     ):
         super().__init__()
 
@@ -915,7 +930,7 @@ class MAE(nn.Module):
                     mlp_ratio=4,
                     dropout=decoder_dropout,
                     parallel_paths=2,
-                    layer_scale=0.1,
+                    layer_scale=1e-4,
                     reattention=True,
                 )
                 for _ in range(decoder_num_blocks)
@@ -938,8 +953,8 @@ class MAE(nn.Module):
 
         n_patches = tokens.shape[1]
 
-        # add PEG encoding
-        tokens = tokens + self.vit.positional_encoding(tokens, *self.vit.n_patches, 1)
+        # add positional encoding
+        tokens = tokens + self.vit.positional_encoding
 
         # make random indices to determine what gets mask/kept
         rand_idx = torch.rand(B, n_patches)
@@ -964,8 +979,12 @@ class MAE(nn.Module):
             batch_indexer, unmask_idx
         ]  # (batch, n_unmask, embed_dim)
 
-        # encode
+        # encode, adding register tokens
+        unmask_tokens, pack_info = pack(
+            [unmask_tokens, self.vit.register_tokens], "b * d"
+        )
         encoded_tokens = self.vit.blocks(unmask_tokens)  # (batch, n_unmask, embed_dim)
+        encoded_tokens, _ = unpack(encoded_tokens, pack_info, "b * d")
         encoded_tokens = self.vit.norm(unmask_tokens)  # (batch, n_unmask, embed_dim)
 
         # project to decoder dim
@@ -1038,9 +1057,17 @@ class LightningWrapper(pl.LightningModule):
             if not k.startswith("inner_"):
                 setattr(self, k, v)
 
+        if hasattr(self, "loss_mod") and hasattr(self, "loss_fn"):
+            raise ValueError("cannot have both loss_mod and loss_fn")
+        elif hasattr(self, "loss_mod"):
+            assert hasattr(
+                self, "loss_mod_args"
+            ), "must have loss_mod_args if loss_mod is present"
+            self.loss_fn = self.loss_mod(**self.loss_mod_args)
+
         self.modelclass = modelclass
 
-        del_keys = ["lr", "loss_fn", "logging"]
+        del_keys = ["lr", "loss_fn", "loss_mod", "loss_mod_args", "logging"]
         inner_kwargs = {k: v for k, v in kwargs.items() if k not in del_keys}
 
         # build model
@@ -1052,8 +1079,8 @@ class LightningWrapper(pl.LightningModule):
         self.custom_step = hasattr(self.model, "step")
 
         assert (
-            self.custom_step or "loss_fn" in kwargs
-        ), "must have loss_fn or custom step (step method in modelclass)"
+            self.custom_step or "loss_fn" or "loss_mod" in kwargs
+        ), "must have loss_fn, loss_mod or custom step (step method in modelclass)"
         assert "lr" in kwargs, "must have lr"
 
     @property
@@ -1074,29 +1101,44 @@ class LightningWrapper(pl.LightningModule):
 
     def _log(self, log_name, loss):
         if self.logging:
-            self.log(
-                log_name,
-                loss,
-                prog_bar=True,
-                logger=True,
-                on_step=True,
-                on_epoch=True,
-                sync_dist=True,
-            )
+            if not isinstance(loss, dict):
+                self.log(
+                    f"{log_name}_loss",
+                    loss,
+                    prog_bar=True,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                    rank_zero_only=True,
+                )
+                return loss
+            else:
+                log_dict = {f"{log_name}_{k}": v for k, v in loss.items()}
+                self.log_dict(
+                    log_dict,
+                    prog_bar=True,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=True,
+                    sync_dist=True,
+                    rank_zero_only=True,
+                )
+                return log_dict[f"{log_name}_loss"]
 
     def training_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("train_loss", loss)
+        loss_aux = self._step(batch, batch_idx)
+        loss = self._log("train", loss_aux)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("val_loss", loss)
+        loss_aux = self._step(batch, batch_idx)
+        loss = self._log("val", loss_aux)
         return loss
 
     def testing_step(self, batch, batch_idx):
-        loss = self._step(batch, batch_idx)
-        self._log("test_loss", loss)
+        loss_aux = self._step(batch, batch_idx)
+        loss = self._log("test", loss_aux)
         return loss
 
     @property

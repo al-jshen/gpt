@@ -1,7 +1,7 @@
 [config]
-dataset = "cifar10" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
+dataset = "mnist" # [cifar10, mnist, imagenet, galaxy10, galaxy10decals]
 model = "vit" # [vit]
-embed_dim = 384
+embed_dim = 128
 mlp_ratio = 2
 conv_kernel_size = 31
 num_blocks = 4
@@ -28,8 +28,8 @@ compile = false
 wandb_track = false
 wandb_entity = "j_shen"
 wandb_project = "gpt"
-wandb_group = "cifar10"
-wandb_notes = "initial long classification test"
-wandb_offline = false
+wandb_group = "mnist"
+wandb_notes = ""
+wandb_offline = true
 wandb_save_dir = "/scratch/gpfs/js5013/programs/gpt/train/"
 wandb_key = "8b68006c061aeb7ad95f4dbdcc8bb2699f0c1da9"
