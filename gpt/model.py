@@ -1,20 +1,24 @@
 from functools import cached_property
-from functools import cached_property
 
-from einops import einsum, rearrange, repeat
 from einops import einsum, pack, rearrange, repeat, unpack
 from einops.layers.torch import Rearrange
-from einops.layers.torch import Rearrange
+from jaxtyping import Float
 import lightning.pytorch as pl
-from lightning.pytorch.strategies import DeepSpeedStrategy
 import numpy as np
+from rotary_embedding_torch import RotaryEmbedding
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 
-from deepspeed.ops.adam import DeepSpeedCPUAdam
 from gpt.utils import patchify
-from rotary_embedding_torch import RotaryEmbedding
+
+
+def zero_init(layer):
+    nn.init.zeros_(layer.weight)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+    return layer
 
 
 def drop_path(
@@ -42,8 +46,77 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
 
 
+class AdaLayerNorm(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        embedding_dim: int,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
+        self.t_emb_proj = zero_init(nn.Linear(embedding_dim, input_dim * 2))
+
+    def forward(
+        self,
+        x: Float[torch.Tensor, "b ... c"],
+        t_emb: Float[torch.Tensor, "b d"],
+    ) -> Float[torch.Tensor, "b ... c"]:
+        c = x.shape[-1]
+        num_spatial_dims = len(x.shape) - 2
+        assert c == self.input_dim, "input_dim must match the last dimension of x"
+
+        t_emb = self.t_emb_proj(t_emb)[:, *((None,) * num_spatial_dims), :]
+        scale, shift = t_emb.chunk(2, dim=-1)
+
+        x = F.layer_norm(x, [c])
+
+        x = x * (1 + scale) + shift
+
+        return x
+
+
+def rms_norm(x, scale, eps):
+    dtype = torch.promote_types(x.dtype, torch.float32)
+    mean_sq = torch.mean(x.to(dtype) ** 2, dim=-1, keepdim=True)
+    scale = scale.to(dtype) * torch.rsqrt(mean_sq + eps)
+    return x * scale.to(x.dtype)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, input_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.scale = nn.Parameter(torch.ones(input_dim))
+
+    def forward(
+        self, x: Float[torch.Tensor, "b ... c"]
+    ) -> Float[torch.Tensor, "b ... c"]:
+        return rms_norm(x, self.scale, self.eps)
+
+
+class AdaRMSNorm(nn.Module):
+    def __init__(self, input_dim: int, embedding_dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.linear = zero_init(nn.Linear(embedding_dim, input_dim, bias=False))
+
+    def forward(
+        self, x: Float[torch.Tensor, "b ... c"], cond: Float[torch.Tensor, "b d"]
+    ) -> Float[torch.Tensor, "b ... c"]:
+        num_spatial_dims = len(x.shape) - 2
+        scale = 1.0 + self.linear(cond)[:, *((None,) * num_spatial_dims), :]
+        return rms_norm(x, scale, self.eps)
+
+
 class Attention(nn.Module):
-    def __init__(self, num_heads=12, embed_dim=768, dropout=0.1, reattention=False):
+    def __init__(
+        self,
+        num_heads=12,
+        embed_dim=768,
+        dropout=0.1,
+        reattention=False,
+    ):
         super().__init__()
 
         assert (
@@ -58,8 +131,8 @@ class Attention(nn.Module):
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
-        self.qnorm = nn.LayerNorm(embed_dim // num_heads)
-        self.knorm = nn.LayerNorm(embed_dim // num_heads)
+        self.qnorm = RMSNorm(embed_dim // num_heads)
+        self.knorm = RMSNorm(embed_dim // num_heads)
 
         self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
 
@@ -69,7 +142,7 @@ class Attention(nn.Module):
             self.reattn_norm = nn.Sequential(
                 Rearrange("b h i j -> b i j h"),
                 Lambda(lambda x: x.contiguous()),
-                nn.LayerNorm(num_heads),
+                RMSNorm(num_heads),
                 Rearrange("b i j h -> b h i j"),
                 Lambda(lambda x: x.contiguous()),
             )
@@ -114,8 +187,10 @@ class Attention(nn.Module):
 
         # Self-attention
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # b n c -> b n 3c -> 3 b n c
+
         q, k, v = map(
-            lambda x: rearrange(x, "b n (he d) -> b he n d", he=H).contiguous(), qkv
+            lambda x: rearrange(x, "b n (he d) -> b he n d", he=H).contiguous(),
+            qkv,
         )  # where channels C = dims D * heads H
 
         q = self.qnorm(q)
@@ -449,8 +524,8 @@ class AxialAttention(nn.Module):
         self.proj = nn.Conv3d(embed_dim, embed_dim, 1)
         self.proj_dropout = nn.Dropout(dropout)
 
-        self.qnorm = nn.LayerNorm(embed_dim // num_heads)
-        self.knorm = nn.LayerNorm(embed_dim // num_heads)
+        self.qnorm = RMSNorm(embed_dim // num_heads)
+        self.knorm = RMSNorm(embed_dim // num_heads)
 
         self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
 
@@ -1141,27 +1216,17 @@ class LightningWrapper(pl.LightningModule):
         loss = self._log("test", loss_aux)
         return loss
 
-    @property
-    def deepspeed_offload(self) -> bool:
-        strategy = self.trainer.strategy
-        if isinstance(strategy, DeepSpeedStrategy):
-            cfg = strategy.config["zero_optimization"]
-            return cfg.get("offload_optimizer") or cfg.get("offload_param")
-        return False
-
     def configure_optimizers(self):
-        if self.deepspeed_offload:
-            optimizer = DeepSpeedCPUAdam(
-                self.parameters(), lr=self.lr, weight_decay=0.1
-            )
-        else:
-            optimizer = torch.optim.AdamW(
-                self.parameters(),
-                lr=self.lr,
-                weight_decay=0.1,
-            )
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=100, T_mult=1, eta_min=1e-6
+        optimizer = optim.AdamW(self.parameters(), lr=self.lr)
+        lr_scheduler = optim.lr_scheduler.SequentialLR(
+            optimizer,
+            [
+                optim.lr_scheduler.LinearLR(
+                    optimizer, start_factor=1e-3, total_iters=self.warmup_steps
+                ),
+                optim.lr_scheduler.ConstantLR(optimizer, factor=1),
+            ],
+            milestones=[self.warmup_steps],
         )
         scheduler = {
             "scheduler": lr_scheduler,
