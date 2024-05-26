@@ -1,17 +1,18 @@
 from functools import cached_property
+from functools import partial
 
 from einops import einsum, pack, rearrange, repeat, unpack
 from einops.layers.torch import Rearrange
-from jaxtyping import Float
 import lightning.pytorch as pl
 import numpy as np
-from rotary_embedding_torch import RotaryEmbedding
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
 from gpt.utils import patchify
+from jaxtyping import Float
+from rotary_embedding_torch import RotaryEmbedding
 
 
 def zero_init(layer):
@@ -116,6 +117,7 @@ class Attention(nn.Module):
         embed_dim=768,
         dropout=0.1,
         reattention=False,
+        is_causal=False,
     ):
         super().__init__()
 
@@ -148,14 +150,14 @@ class Attention(nn.Module):
             )
             self.v_ones = None
 
+        self.is_causal = is_causal
+
     def scaled_dot_product_reattention(
         self,
         query,
         key,
         value,
-        attn_mask=None,
         dropout_p=0.0,
-        is_causal=False,
         scale=None,
     ):
         B, H, N, C = query.shape
@@ -170,9 +172,9 @@ class Attention(nn.Module):
             query,
             key,
             self.v_ones.expand(B, H, N, N),
-            attn_mask=attn_mask,
+            attn_mask=None,
             dropout_p=dropout_p,
-            is_causal=is_causal,
+            is_causal=self.is_causal,
             scale=scale,
         )
 
@@ -200,14 +202,13 @@ class Attention(nn.Module):
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
-            y = self.scaled_dot_product_reattention(
-                q, k, v, dropout_p=self.dropout if self.training else 0.0
-            )
-
+            attn_fn = self.scaled_dot_product_reattention
         else:
-            y = F.scaled_dot_product_attention(
-                q, k, v, dropout_p=self.dropout if self.training else 0.0
-            )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
+            attn_fn = partial(F.scaled_dot_product_attention, is_causal=self.is_causal)
+
+        y = attn_fn(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0
+        )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
 
         # Project back to embedding dimension
         y = rearrange(y, "b h t d -> b t (h d)").contiguous()
@@ -506,7 +507,14 @@ class ConvolutionalGatingMLP(torch.nn.Module):
 
 
 class AxialAttention(nn.Module):
-    def __init__(self, embed_dim=768, num_heads=12, dropout=0.1, reattention=False):
+    def __init__(
+        self,
+        embed_dim=768,
+        num_heads=12,
+        dropout=0.1,
+        reattention=False,
+        is_causal=False,
+    ):
         super().__init__()
 
         assert (
@@ -542,14 +550,14 @@ class AxialAttention(nn.Module):
             )
             self.v_ones = None
 
+        self.is_causal = is_causal
+
     def scaled_dot_product_reattention(
         self,
         query,
         key,
         value,
-        attn_mask=None,
         dropout_p=0.0,
-        is_causal=False,
         scale=None,
     ):
         B, H, N, C = query.shape
@@ -564,9 +572,9 @@ class AxialAttention(nn.Module):
             query,
             key,
             self.v_ones.expand(B, H, N, N),
-            attn_mask=attn_mask,
+            attn_mask=None,
             dropout_p=dropout_p,
-            is_causal=is_causal,
+            is_causal=self.is_causal,
             scale=scale,
         )
 
@@ -597,13 +605,15 @@ class AxialAttention(nn.Module):
         if self.reattention:
             attn_fn = self.scaled_dot_product_reattention
         else:
-            attn_fn = F.scaled_dot_product_attention
+            attn_fn = partial(F.scaled_dot_product_attention, is_causal=self.is_causal)
+
+        attn_fn = partial(attn_fn, dropout_p=self.dropout if self.training else 0.0)
 
         qh, kh, vh = map(
             lambda x: rearrange(x, "b he h w d c -> (b w d) he h c").contiguous(),
             (q, k, v),
         )
-        yh = attn_fn(qh, kh, vh, dropout_p=self.dropout if self.training else 0.0)
+        yh = attn_fn(qh, kh, vh)
         yh = rearrange(
             yh, "(b w d) he h c -> b (he c) h w d", he=he, h=h, w=w, d=d
         ).contiguous()
@@ -612,7 +622,7 @@ class AxialAttention(nn.Module):
             lambda x: rearrange(x, "b he h w d c -> (b h d) he w c").contiguous(),
             (q, k, v),
         )
-        yw = attn_fn(qw, kw, vw, dropout_p=self.dropout if self.training else 0.0)
+        yw = attn_fn(qw, kw, vw)
         yw = rearrange(
             yw, "(b h d) he w c -> b (he c) h w d", he=he, h=h, w=w, d=d
         ).contiguous()
@@ -621,7 +631,7 @@ class AxialAttention(nn.Module):
             lambda x: rearrange(x, "b he h w d c -> (b h w) he d c").contiguous(),
             (q, k, v),
         )
-        yd = attn_fn(qd, kd, vd, dropout_p=self.dropout if self.training else 0.0)
+        yd = attn_fn(qd, kd, vd)
         yd = rearrange(
             yd, "(b h w) he d c -> b (he c) h w d", he=he, h=h, w=w, d=d
         ).contiguous()
@@ -661,6 +671,7 @@ class TransformerBlock(nn.Module):
         layer_scale=1e-5,
         reattention=True,
         axial_3d=False,
+        is_causal=False,
     ):
         super().__init__()
         self.axial_3d = axial_3d
@@ -677,6 +688,7 @@ class TransformerBlock(nn.Module):
                     embed_dim=embed_dim,
                     dropout=dropout,
                     reattention=reattention,
+                    is_causal=is_causal,
                 )
                 if not axial_3d
                 else AxialAttention(
@@ -684,6 +696,7 @@ class TransformerBlock(nn.Module):
                     embed_dim=embed_dim,
                     dropout=dropout,
                     reattention=reattention,
+                    is_causal=is_causal,
                 )
                 for _ in range(parallel_paths)
             ]
@@ -846,22 +859,6 @@ class ViT(nn.Module):
         self.n_patches: tuple[int, ...] = tuple(
             [image_size[d] // patch_size[d] for d in range(self.spatial_dims)]
         )
-
-        # patch_dim = np.prod(patch_size) * image_channels
-
-        # self.to_patch = Rearrange(
-        #     "b c (nh p1) (nw p2) -> b (nh nw) (p1 p2 c)",
-        #     p1=patch_size[0],
-        #     p2=patch_size[1],
-        #     nh=self.n_patches[0],
-        #     nw=self.n_patches[1],
-        # )
-
-        # self.patch_embed = nn.Sequential(
-        #     nn.LayerNorm(patch_dim),
-        #     nn.Linear(patch_dim, embed_dim),
-        #     nn.LayerNorm(embed_dim),
-        # )
 
         self.input_head = nn.Conv2d(
             image_channels,
