@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import math
 
 from gpt.utils import patchify
 from jaxtyping import Float
@@ -118,6 +119,7 @@ class Attention(nn.Module):
         dropout=0.1,
         reattention=False,
         is_causal=False,
+        use_rope=True,
     ):
         super().__init__()
 
@@ -129,14 +131,17 @@ class Attention(nn.Module):
         self.embed_dim = embed_dim
         self.dropout = dropout
 
-        self.to_qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
         self.qnorm = RMSNorm(embed_dim // num_heads)
         self.knorm = RMSNorm(embed_dim // num_heads)
 
-        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+        if use_rope:
+            self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+            self.rope_fn = self.rope.rotate_queries_and_keys
+        else:
+            self.rope_fn = lambda q, k: (q, k)
 
         self.reattention = reattention
         if reattention:
@@ -159,6 +164,7 @@ class Attention(nn.Module):
         value,
         dropout_p=0.0,
         scale=None,
+        attn_mask=None,
     ):
         B, H, N, C = query.shape
         if self.v_ones is None or self.v_ones.shape[1] != N:
@@ -172,7 +178,7 @@ class Attention(nn.Module):
             query,
             key,
             self.v_ones.expand(B, H, N, N),
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=dropout_p,
             is_causal=self.is_causal,
             scale=scale,
@@ -183,22 +189,22 @@ class Attention(nn.Module):
 
         return attn_weight @ value
 
-    def forward(self, x):
+    def forward(self, q, k, v, attn_mask=None):
         # B, N, C = x.shape  # c = embed_dim, N = sequences (patches)
         H = self.num_heads
 
-        # Self-attention
-        qkv = self.to_qkv(x).chunk(3, dim=-1)  # b n c -> b n 3c -> 3 b n c
+        # # Self-attention
+        # qkv = self.to_qkv(x).chunk(3, dim=-1)  # b n c -> b n 3c -> 3 b n c
 
         q, k, v = map(
             lambda x: rearrange(x, "b n (he d) -> b he n d", he=H).contiguous(),
-            qkv,
+            (q, k, v),
         )  # where channels C = dims D * heads H
 
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        q, k = self.rope.rotate_queries_and_keys(q, k)
+        q, k = self.rope_fn(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -207,7 +213,7 @@ class Attention(nn.Module):
             attn_fn = partial(F.scaled_dot_product_attention, is_causal=self.is_causal)
 
         y = attn_fn(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0
+            q, k, v, dropout_p=self.dropout if self.training else 0.0, attn_mask=attn_mask,
         )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
 
         # Project back to embedding dimension
@@ -218,6 +224,19 @@ class Attention(nn.Module):
         y = self.proj_dropout(y)
 
         return y
+
+class SelfAttention(Attention):
+    def forward(self, x, attn_mask=None):
+        return super().forward(x, x, x, attn_mask=attn_mask)
+
+class CrossAttention(Attention):
+    def forward(self, x, y, attn_mask=None):
+        return super().forward(x, y, y, attn_mask=attn_mask)
+
+class MMAttention(SelfAttention):
+    def forward(self, x, y, attn_mask=None):
+        xy = torch.cat((x, y), dim=1) # along sequence dim
+        return super().forward(xy, attn_mask=attn_mask)
 
 
 _kernel_sizes = {
@@ -514,6 +533,7 @@ class AxialAttention(nn.Module):
         dropout=0.1,
         reattention=False,
         is_causal=False,
+        use_rope=True,
     ):
         super().__init__()
 
@@ -535,7 +555,11 @@ class AxialAttention(nn.Module):
         self.qnorm = RMSNorm(embed_dim // num_heads)
         self.knorm = RMSNorm(embed_dim // num_heads)
 
-        self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+        if use_rope:
+            self.rope = RotaryEmbedding(dim=embed_dim // num_heads // 2, use_xpos=True)
+            self.rope_fn = self.rope.rotate_queries_and_keys
+        else:
+            self.rope_fn = lambda q, k: (q, k)
 
         self.reattention = reattention
 
@@ -599,7 +623,7 @@ class AxialAttention(nn.Module):
         q = self.qnorm(q)
         k = self.knorm(k)
 
-        q, k = self.rope.rotate_queries_and_keys(q, k)
+        q, k = self.rope_fn(q, k)
 
         # Scale dot product attention, attend over T dim (2nd last)
         if self.reattention:
@@ -647,7 +671,7 @@ class AxialAttention(nn.Module):
         return y
 
 
-class TransformerBlock(nn.Module):
+class ComplicatedTransformerBlock(nn.Module):
     """Transformer block.
 
     Additional tweaks:
@@ -674,6 +698,8 @@ class TransformerBlock(nn.Module):
         is_causal=False,
     ):
         super().__init__()
+        if axial_3d:
+            raise NotImplementedError("Axial 3D is not implemented yet.")
         self.axial_3d = axial_3d
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
@@ -743,19 +769,24 @@ class TransformerBlock(nn.Module):
             # x has shape (batch, sequence_length, embed_dim)
             x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
             x1 = x2 = x  # split branches
-            x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
 
+            # branch 1
+            x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1), self.ln1(x1), self.ln1(x1)))
             x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
+
+            # branch 2
             x2 = x2 + self.drop_path(
                 self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
             )
+
+            # join branches, e-branchformer style merge
             x_out = torch.cat(
                 (x1, x2), dim=-1
             )  # (batch, sequence_length, embed_dim * 2)
-            # e-branchformer style merge
             x_out = (
                 self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
             )  # (batch, sequence_length, embed_dim * 2)
+
             x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
             x_out = 0.5 * self.mlp2(x_out) + x_out
             return x_out
@@ -795,6 +826,49 @@ class TransformerBlock(nn.Module):
             x_out = rearrange(x_out, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
             return x_out
 
+class SinusoidalEmbedding(nn.Module):
+    def __init__(self, hidden_dim, min_period, max_period, dtype=torch.float32):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.min_period = min_period
+        self.max_period = max_period
+        self.register_buffer("freqs", 2 * math.pi / torch.logspace(math.log10(min_period), math.log10(max_period), hidden_dim // 2, dtype=dtype))
+
+    def forward(self, x):
+        triarg = self.freqs * x.unsqueeze(1)
+        # interleave sin and cos
+        pe = torch.zeros(x.size(0), self.hidden_dim, device=x.device, dtype=x.dtype)
+        pe[:, 0::2] = torch.sin(triarg)
+        pe[:, 1::2] = torch.cos(triarg)
+        return pe.unsqueeze(0)
+
+class RevIN(nn.Module):
+    """
+    Affine reversible instance norm.
+    """
+    def __init__(self, channels):
+        super().__init__()
+        self.dims = channels
+        self.norm_scale = nn.Parameter(torch.ones(1, channels)) # extra dim for batch
+        self.norm_shift = nn.Parameter(torch.zeros(1, channels))
+        self.unnorm_scale = nn.Parameter(torch.ones(1, channels)) 
+        self.unnorm_shift = nn.Parameter(torch.zeros(1, channels))
+
+    def normalize(self, x):
+        rest = tuple(range(2, x.ndim)) # everything but batch and channels
+        assert x.shape[1] == self.dims # proper number of channels
+        std, mean = torch.std_mean(x, axis=rest, keepdim=True)
+        return ((x - mean) / std) * self.norm_scale + self.norm_shift, mean, std
+
+    def forward(self, x):
+        return self.normalize(x)
+    
+    def unnormalize(self, x, mean, std):
+        x = (x - self.norm_shift) / self.norm_scale
+        x = x * std + mean
+        x = x * self.unnorm_scale + self.unnorm_shift
+        return x
+        
 
 class PEG(nn.Module):
     """
@@ -888,7 +962,7 @@ class ViT(nn.Module):
 
         self.blocks = nn.Sequential(
             *[
-                TransformerBlock(
+                ComplicatedTransformerBlock(
                     num_heads,
                     embed_dim,
                     mlp_ratio,
@@ -996,7 +1070,7 @@ class MAE(nn.Module):
         self.encoder_to_decoder = nn.Linear(self.vit.embed_dim, self.decoder_dim)
         self.decoder = nn.Sequential(
             *[
-                TransformerBlock(
+                ComplicatedTransformerBlock(
                     num_heads=decoder_num_heads,
                     embed_dim=decoder_dim,
                     mlp_ratio=4,
