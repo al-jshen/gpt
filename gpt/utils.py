@@ -58,3 +58,9 @@ def _patchify(x, patch_size):
         .contiguous()
         .view(nh * nw, ph * pw * C)
     )
+
+def flatten(nested_list):
+    return [item for sublist in nested_list for item in sublist]
+
+def nparams(model):
+    return sum(p.numel() for p in model.parameters())
