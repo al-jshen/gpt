@@ -175,7 +175,7 @@ class TSTransformer(nn.Module):
         out = rearrange(out, "b c n -> b n c")
         return out
 
-    def forecast(self, t, x):
+    def forecast(self, t, x, recapture=False):
         """
         For t with shape n_t and x with shape b n c with n < n_t, forecast the future n_t - n steps.
         """
@@ -188,6 +188,8 @@ class TSTransformer(nn.Module):
             dec_out = self.decoder(t[:i], x_norm, enc_out)[..., -1:, :]
             out = self.output_head(dec_out)
             x_norm = torch.cat([x_norm, out], dim=1)
+            if recapture:
+                enc_out = self.encoder(t[: i + 1], x_norm)
 
         out = rearrange(x_norm, "b n c -> b c n")
         out = self.revin.unnormalize(out, mean, std)
