@@ -376,7 +376,6 @@ class MLP(nn.Module):
         if hidden_dim is None:
             hidden_dim = in_dim * 2
         self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
             nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
