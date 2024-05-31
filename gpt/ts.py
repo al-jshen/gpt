@@ -30,7 +30,7 @@ class TransformerEncoder(nn.Module):
         )
         self.mlps = nn.Sequential(
             *[
-                MLP(embed_dim, embed_dim * mlp_ratio, dropout=dropout)
+                MLP(embed_dim, embed_dim, embed_dim * mlp_ratio, dropout=dropout)
                 for _ in range(num_layers)
             ]
         )
@@ -98,7 +98,7 @@ class TransformerDecoder(nn.Module):
         )
         self.mlps = nn.Sequential(
             *[
-                MLP(embed_dim, embed_dim * mlp_ratio, dropout=dropout)
+                MLP(embed_dim, embed_dim, embed_dim * mlp_ratio, dropout=dropout)
                 for _ in range(num_layers)
             ]
         )
