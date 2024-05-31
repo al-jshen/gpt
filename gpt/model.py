@@ -213,7 +213,11 @@ class Attention(nn.Module):
             attn_fn = partial(F.scaled_dot_product_attention, is_causal=self.is_causal)
 
         y = attn_fn(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0, attn_mask=attn_mask,
+            q,
+            k,
+            v,
+            dropout_p=self.dropout if self.training else 0.0,
+            attn_mask=attn_mask,
         )  # L = t, S = t, E = d, Ev = d, so output is (b h t d)
 
         # Project back to embedding dimension
@@ -225,17 +229,20 @@ class Attention(nn.Module):
 
         return y
 
+
 class SelfAttention(Attention):
     def forward(self, x, attn_mask=None):
         return super().forward(x, x, x, attn_mask=attn_mask)
+
 
 class CrossAttention(Attention):
     def forward(self, x, y, attn_mask=None):
         return super().forward(x, y, y, attn_mask=attn_mask)
 
+
 class MMAttention(SelfAttention):
     def forward(self, x, y, attn_mask=None):
-        xy = torch.cat((x, y), dim=1) # along sequence dim
+        xy = torch.cat((x, y), dim=1)  # along sequence dim
         return super().forward(xy, attn_mask=attn_mask)
 
 
@@ -364,14 +371,16 @@ class hMLP_output(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.1):
+    def __init__(self, in_dim, out_dim, hidden_dim=None, dropout=0.1):
         super().__init__()
+        if hidden_dim is None:
+            hidden_dim = in_dim * 2
         self.net = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
+            nn.Linear(hidden_dim, out_dim),
         )
 
     def forward(self, x):
@@ -383,8 +392,8 @@ class Lambda(nn.Module):
         super().__init__()
         self.fn = fn
 
-    def forward(self, x):
-        return self.fn(x)
+    def forward(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
 
 
 class ClassificationHead(nn.Module):
@@ -729,7 +738,7 @@ class ComplicatedTransformerBlock(nn.Module):
         )
         self.mlps = Parallel(
             [
-                MLP(embed_dim, embed_dim * mlp_ratio, dropout=dropout)
+                MLP(embed_dim, embed_dim, embed_dim * mlp_ratio, dropout=dropout)
                 for _ in range(parallel_paths)
             ]
         )
@@ -745,8 +754,8 @@ class ComplicatedTransformerBlock(nn.Module):
                 for _ in range(parallel_paths)
             ]
         )
-        self.mlp1 = MLP(embed_dim, embed_dim * 2, dropout=dropout)
-        self.mlp2 = MLP(embed_dim, embed_dim * 2, dropout=dropout)
+        self.mlp1 = MLP(embed_dim, embed_dim, embed_dim * 2, dropout=dropout)
+        self.mlp2 = MLP(embed_dim, embed_dim, embed_dim * 2, dropout=dropout)
         self.dwconv = nn.Conv1d(
             embed_dim * 2,
             embed_dim * 2,
@@ -771,7 +780,10 @@ class ComplicatedTransformerBlock(nn.Module):
             x1 = x2 = x  # split branches
 
             # branch 1
-            x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1), self.ln1(x1), self.ln1(x1)))
+            x1 = x1 + self.drop_path(
+                self.ls1[None, None, :]
+                * self.attns(self.ln1(x1), self.ln1(x1), self.ln1(x1))
+            )
             x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
 
             # branch 2
@@ -826,13 +838,24 @@ class ComplicatedTransformerBlock(nn.Module):
             x_out = rearrange(x_out, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
             return x_out
 
+
 class SinusoidalEmbedding(nn.Module):
     def __init__(self, hidden_dim, min_period, max_period, dtype=torch.float32):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.min_period = min_period
         self.max_period = max_period
-        self.register_buffer("freqs", 2 * math.pi / torch.logspace(math.log10(min_period), math.log10(max_period), hidden_dim // 2, dtype=dtype))
+        self.register_buffer(
+            "freqs",
+            2
+            * math.pi
+            / torch.logspace(
+                math.log10(min_period),
+                math.log10(max_period),
+                hidden_dim // 2,
+                dtype=dtype,
+            ),
+        )
 
     def forward(self, x):
         triarg = self.freqs * x.unsqueeze(1)
@@ -842,33 +865,35 @@ class SinusoidalEmbedding(nn.Module):
         pe[:, 1::2] = torch.cos(triarg)
         return pe.unsqueeze(0)
 
+
 class RevIN(nn.Module):
     """
     Affine reversible instance norm.
     """
+
     def __init__(self, channels):
         super().__init__()
         self.dims = channels
-        self.norm_scale = nn.Parameter(torch.ones(1, channels)) # extra dim for batch
+        self.norm_scale = nn.Parameter(torch.ones(1, channels))  # extra dim for batch
         self.norm_shift = nn.Parameter(torch.zeros(1, channels))
-        self.unnorm_scale = nn.Parameter(torch.ones(1, channels)) 
+        self.unnorm_scale = nn.Parameter(torch.ones(1, channels))
         self.unnorm_shift = nn.Parameter(torch.zeros(1, channels))
 
     def normalize(self, x):
-        rest = tuple(range(2, x.ndim)) # everything but batch and channels
-        assert x.shape[1] == self.dims # proper number of channels
+        rest = tuple(range(2, x.ndim))  # everything but batch and channels
+        assert x.shape[1] == self.dims  # proper number of channels
         std, mean = torch.std_mean(x, axis=rest, keepdim=True)
         return ((x - mean) / std) * self.norm_scale + self.norm_shift, mean, std
 
     def forward(self, x):
         return self.normalize(x)
-    
+
     def unnormalize(self, x, mean, std):
         x = (x - self.norm_shift) / self.norm_scale
         x = x * std + mean
         x = x * self.unnorm_scale + self.unnorm_shift
         return x
-        
+
 
 class PEG(nn.Module):
     """
