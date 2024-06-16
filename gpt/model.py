@@ -705,6 +705,13 @@ class AxialAttention(nn.Module):
         return y
 
 
+def on_channel_first(fn, x):
+    x = rearrange(x, "b c ... -> b ... c")
+    x = fn(x)
+    x = rearrange(x, "b ... c -> b c ...")
+    return x
+
+
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -743,9 +750,26 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(embed_dim, embed_dim, embed_dim * mlp_ratio, dropout=dropout)
 
     def forward(self, x):
-        x = x + self.ls1[None, None, :] * self.attn(self.ln1(x))
-        x = x + self.ls2[None, None, :] * self.mlp(self.ln2(x))
-        return x
+        if not self.axial:
+            # b, n, c = x.shape
+            x = x + self.ls1[None, None, :] * self.attn(self.ln1(x))
+            x = x + self.ls2[None, None, :] * self.mlp(self.ln2(x))
+            return x
+        else:
+            # b, c, ... = x.shape
+            b, n = x.shape[:2]
+            len_spatial_dims = x.ndim - 2
+
+            x = x + self.ls1[
+                None, :, *(None for _ in range(len_spatial_dims))
+            ] * self.attn(on_channel_first(self.ln1, x))
+
+            mlp_and_norm = lambda x: self.mlp(self.ln2(x))
+            x = x + self.ls2[
+                None, :, *(None for _ in range(len_spatial_dims))
+            ] * on_channel_first(mlp_and_norm, x)
+
+            return x
 
 
 class TransformerBlockv1(nn.Module):
@@ -833,33 +857,34 @@ class TransformerBlockv1(nn.Module):
         self.proj = nn.Linear(embed_dim * 2, embed_dim)
         self.drop_path = DropPath(dropout)
 
-    def channel_last(self, fn, x):
-        x = rearrange(x, "b c ... -> b ... c")
-        x = fn(x)
-        x = rearrange(x, "b ... c -> b c ...")
-        return x
-
     def forward(self, x):
         # x has shape (batch, sequence_length, embed_dim)
-        x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
-        x1 = x2 = x  # split branches
+        if not self.axial:
+            x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
+            x1 = x2 = x  # split branches
 
-        # branch 1
-        x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
-        x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
+            # branch 1
+            x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+            x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
 
-        # branch 2
-        x2 = x2 + self.drop_path(self.ls3[None, None, :] * self.cgmlps(self.ln3(x2)))
+            # branch 2
+            x2 = x2 + self.drop_path(
+                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
+            )
 
-        # join branches, e-branchformer style merge
-        x_out = torch.cat((x1, x2), dim=-1)  # (batch, sequence_length, embed_dim * 2)
-        x_out = (
-            self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
-        )  # (batch, sequence_length, embed_dim * 2)
+            # join branches, e-branchformer style merge
+            x_out = torch.cat(
+                (x1, x2), dim=-1
+            )  # (batch, sequence_length, embed_dim * 2)
+            x_out = (
+                self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
+            )  # (batch, sequence_length, embed_dim * 2)
 
-        x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
-        x_out = 0.5 * self.mlp2(x_out) + x_out
-        return x_out
+            x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
+            x_out = 0.5 * self.mlp2(x_out) + x_out
+            return x_out
+        else:
+            raise NotImplementedError("Axial attention not implemented yet")
 
 
 class SinusoidalEmbedding(nn.Module):
