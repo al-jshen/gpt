@@ -316,6 +316,8 @@ class hMLP_stem(nn.Module):
 
     def forward(self, x):
         # b c h w
+        if self.spatial_dims == 1:
+            return self.in_proj(x.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
         if self.spatial_dims == 2:
             return self.in_proj(x.unsqueeze(-1)).squeeze(-1)
         # b c h w d
@@ -367,6 +369,8 @@ class hMLP_output(nn.Module):
         )
 
     def forward(self, x):
+        if self.spatial_dims == 1:
+            return self.out_proj(x.unsqueeze(-1).unsqueeze(-1)).squeeze(-1).squeeze(-1)
         if self.spatial_dims == 2:
             return self.out_proj(x.unsqueeze(-1)).squeeze(-1)
         return self.out_proj(x)
