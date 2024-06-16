@@ -131,6 +131,8 @@ class Attention(nn.Module):
         self.embed_dim = embed_dim
         self.dropout = dropout
 
+        # self.to_qkv = nn.Linear(embed_dim, embed_dim * 3)
+
         self.proj = nn.Linear(embed_dim, embed_dim)
         self.proj_dropout = nn.Dropout(dropout)
 
@@ -616,24 +618,34 @@ class AxialAttention(nn.Module):
         return attn_weight @ value
 
     def forward(self, x):
-        b, c, h, w, d = x.shape
+        # b, c, h, w, d = x.shape
+        b, c = x.shape[:2]
+        n_spatial_dims = x.ndim - 2
+
+        # pad to 3 spatial dims
+        while x.ndim < 5:
+            x = x.unsqueeze(-1)
+
+        h, w, d = x.shape[2:]
+
         he = self.num_heads
 
+        # split into heads
         x = self.norm1(x)
         qkv = self.to_qkv(x).chunk(3, dim=1)  # b c h w d -> b 3c h w d -> 3 b c h w d
         q, k, v = map(
-            lambda x: rearrange(
-                x, "b (he c) h w d -> b he h w d c", he=he
-            ).contiguous(),
+            lambda x: rearrange(x, "b (he c) ... -> b he ... c", he=he).contiguous(),
             qkv,
         )  # where channels C = dims D * heads H
 
+        # qk norm
         q = self.qnorm(q)
         k = self.knorm(k)
 
+        # rotary positional encoding
         q, k = self.rope_fn(q, k)
 
-        # Scale dot product attention, attend over T dim (2nd last)
+        # choose attention fn, attend over T dim (2nd last)
         if self.reattention:
             attn_fn = self.scaled_dot_product_reattention
         else:
@@ -641,6 +653,7 @@ class AxialAttention(nn.Module):
 
         attn_fn = partial(attn_fn, dropout_p=self.dropout if self.training else 0.0)
 
+        # axial attention over first spatial dim
         qh, kh, vh = map(
             lambda x: rearrange(x, "b he h w d c -> (b w d) he h c").contiguous(),
             (q, k, v),
@@ -650,25 +663,34 @@ class AxialAttention(nn.Module):
             yh, "(b w d) he h c -> b (he c) h w d", he=he, h=h, w=w, d=d
         ).contiguous()
 
-        qw, kw, vw = map(
-            lambda x: rearrange(x, "b he h w d c -> (b h d) he w c").contiguous(),
-            (q, k, v),
-        )
-        yw = attn_fn(qw, kw, vw)
-        yw = rearrange(
-            yw, "(b h d) he w c -> b (he c) h w d", he=he, h=h, w=w, d=d
-        ).contiguous()
+        # axial attention over second spatial dim
+        if n_spatial_dims > 1:
+            qw, kw, vw = map(
+                lambda x: rearrange(x, "b he h w d c -> (b h d) he w c").contiguous(),
+                (q, k, v),
+            )
+            yw = attn_fn(qw, kw, vw)
+            yw = rearrange(
+                yw, "(b h d) he w c -> b (he c) h w d", he=he, h=h, w=w, d=d
+            ).contiguous()
+        else:
+            yw = 0
 
-        qd, kd, vd = map(
-            lambda x: rearrange(x, "b he h w d c -> (b h w) he d c").contiguous(),
-            (q, k, v),
-        )
-        yd = attn_fn(qd, kd, vd)
-        yd = rearrange(
-            yd, "(b h w) he d c -> b (he c) h w d", he=he, h=h, w=w, d=d
-        ).contiguous()
+        # axial attention over third spatial dim
+        if n_spatial_dims > 2:
+            qd, kd, vd = map(
+                lambda x: rearrange(x, "b he h w d c -> (b h w) he d c").contiguous(),
+                (q, k, v),
+            )
+            yd = attn_fn(qd, kd, vd)
+            yd = rearrange(
+                yd, "(b h w) he d c -> b (he c) h w d", he=he, h=h, w=w, d=d
+            ).contiguous()
+        else:
+            yd = 0
 
-        y = (yh + yw + yd) / 3
+        # combine axial attentions
+        y = (yh + yw + yd) / n_spatial_dims
 
         y = self.norm2(y)
 
@@ -676,11 +698,58 @@ class AxialAttention(nn.Module):
         y = self.proj(y)
         y = self.proj_dropout(y)
 
+        # bring back to original shape
+        while y.ndim - 2 > n_spatial_dims:
+            y = y.squeeze(-1)
+
         return y
 
 
-class ComplicatedTransformerBlock(nn.Module):
-    """Transformer block.
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        num_heads=12,
+        embed_dim=768,
+        mlp_ratio=4,
+        dropout=0.1,
+        layer_scale=1e-5,
+        reattention=False,
+        axial=False,
+        is_causal=False,
+    ):
+        super().__init__()
+        self.axial = axial
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.ls1 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
+        self.ls2 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
+        self.attn = (
+            SelfAttention(
+                num_heads=num_heads,
+                embed_dim=embed_dim,
+                dropout=dropout,
+                reattention=reattention,
+                is_causal=is_causal,
+            )
+            if not axial
+            else AxialAttention(
+                num_heads=num_heads,
+                embed_dim=embed_dim,
+                dropout=dropout,
+                reattention=reattention,
+                is_causal=is_causal,
+            )
+        )
+        self.mlp = MLP(embed_dim, embed_dim, embed_dim * mlp_ratio, dropout=dropout)
+
+    def forward(self, x):
+        x = x + self.ls1[None, None, :] * self.attn(self.ln1(x))
+        x = x + self.ls2[None, None, :] * self.mlp(self.ln2(x))
+        return x
+
+
+class TransformerBlockv1(nn.Module):
+    """Complicated Transformer block.
 
     Additional tweaks:
     - layerscale (https://arxiv.org/pdf/2103.17239.pdf)
@@ -702,13 +771,11 @@ class ComplicatedTransformerBlock(nn.Module):
         parallel_paths=2,
         layer_scale=1e-5,
         reattention=True,
-        axial_3d=False,
+        axial=False,
         is_causal=False,
     ):
         super().__init__()
-        if axial_3d:
-            raise NotImplementedError("Axial 3D is not implemented yet.")
-        self.axial_3d = axial_3d
+        self.axial = axial
         self.ln1 = nn.LayerNorm(embed_dim)
         self.ln2 = nn.LayerNorm(embed_dim)
         self.ln3 = nn.LayerNorm(embed_dim)
@@ -717,14 +784,14 @@ class ComplicatedTransformerBlock(nn.Module):
         self.ls3 = nn.Parameter(torch.ones(embed_dim) * layer_scale, requires_grad=True)
         self.attns = Parallel(
             [
-                Attention(
+                SelfAttention(
                     num_heads=num_heads,
                     embed_dim=embed_dim,
                     dropout=dropout,
                     reattention=reattention,
                     is_causal=is_causal,
                 )
-                if not axial_3d
+                if not axial
                 else AxialAttention(
                     num_heads=num_heads,
                     embed_dim=embed_dim,
@@ -773,69 +840,26 @@ class ComplicatedTransformerBlock(nn.Module):
         return x
 
     def forward(self, x):
-        if not self.axial_3d:
-            # x has shape (batch, sequence_length, embed_dim)
-            x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
-            x1 = x2 = x  # split branches
+        # x has shape (batch, sequence_length, embed_dim)
+        x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
+        x1 = x2 = x  # split branches
 
-            # branch 1
-            x1 = x1 + self.drop_path(
-                self.ls1[None, None, :]
-                * self.attns(self.ln1(x1), self.ln1(x1), self.ln1(x1))
-            )
-            x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
+        # branch 1
+        x1 = x1 + self.drop_path(self.ls1[None, None, :] * self.attns(self.ln1(x1)))
+        x1 = x1 + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
 
-            # branch 2
-            x2 = x2 + self.drop_path(
-                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
-            )
+        # branch 2
+        x2 = x2 + self.drop_path(self.ls3[None, None, :] * self.cgmlps(self.ln3(x2)))
 
-            # join branches, e-branchformer style merge
-            x_out = torch.cat(
-                (x1, x2), dim=-1
-            )  # (batch, sequence_length, embed_dim * 2)
-            x_out = (
-                self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
-            )  # (batch, sequence_length, embed_dim * 2)
+        # join branches, e-branchformer style merge
+        x_out = torch.cat((x1, x2), dim=-1)  # (batch, sequence_length, embed_dim * 2)
+        x_out = (
+            self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
+        )  # (batch, sequence_length, embed_dim * 2)
 
-            x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
-            x_out = 0.5 * self.mlp2(x_out) + x_out
-            return x_out
-
-        if self.axial_3d:
-            b, c, h, w, d = x.shape
-            x = rearrange(x, "b c h w d -> b (h w d) c")
-            x = 0.5 * self.mlp1(x) + x  # (batch, sequence_length, embed_dim)
-            x1 = x2 = x  # split branches
-            x1 = (
-                x1
-                + self.drop_path(
-                    self.ls1[None, None, :]
-                    * rearrange(
-                        self.attns(
-                            rearrange(
-                                self.ln1(x1), "b (h w d) c -> b c h w d", h=h, w=w, d=d
-                            ).contiguous()
-                        ),
-                        "b c h w d -> b (h w d) c",
-                    ).contiguous()
-                )
-                # + self.drop_path(self.ls2[None, None, :] * self.mlps(self.ln2(x1)))
-            )
-            x2 = x2 + self.drop_path(
-                self.ls3[None, None, :] * self.cgmlps(self.ln3(x2))
-            )
-            x_out = torch.cat(
-                (x1, x2), dim=-1
-            )  # (batch, sequence_length, embed_dim * 2)
-            # e-branchformer style merge
-            x_out = (
-                self.dwconv(x_out.transpose(1, 2)).transpose(1, 2).contiguous() + x_out
-            )  # (batch, sequence_length, embed_dim * 2)
-            x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
-            x_out = 0.5 * self.mlp2(x_out) + x_out
-            x_out = rearrange(x_out, "b (h w d) c -> b c h w d", h=h, w=w, d=d)
-            return x_out
+        x_out = self.proj(x_out) + x  # (batch, sequence_length, embed_dim)
+        x_out = 0.5 * self.mlp2(x_out) + x_out
+        return x_out
 
 
 class SinusoidalEmbedding(nn.Module):
@@ -882,49 +906,33 @@ class RevIN(nn.Module):
         rest = tuple(range(2, x.ndim))  # everything but batch and channels
         assert x.shape[1] == self.dims  # proper number of channels
         std, mean = torch.std_mean(x, axis=rest, keepdim=True)
-        return ((x - mean) / std) * self.norm_scale + self.norm_shift, mean, std
+        n_rest = len(rest)
+        return (
+            ((x - mean) / std) * self.expand_back(self.norm_scale, n_rest)
+            + self.expand_back(self.norm_shift, n_rest),
+            mean,
+            std,
+        )
 
     def forward(self, x):
         return self.normalize(x)
 
     def unnormalize(self, x, mean, std):
-        x = (x - self.norm_shift) / self.norm_scale
+        n_rest = len(x.shape) - 2
+        x = (x - self.expand_back(self.norm_shift, n_rest)) / self.expand_back(
+            self.norm_scale, n_rest
+        )
         x = x * std + mean
-        x = x * self.unnorm_scale + self.unnorm_shift
+        x = x * self.expand_back(self.unnorm_scale, n_rest) + self.expand_back(
+            self.unnorm_shift, n_rest
+        )
         return x
 
-
-class PEG(nn.Module):
-    """
-    Positional Encoding Generator from https://arxiv.org/pdf/2102.10882.pdf
-    """
-
-    def __init__(self, in_chans, embed_dim=768, kernel_size=3, stride=1):
-        super().__init__()
-        assert kernel_size >= 3, "kernel size must be at least 3"
-        padding = (kernel_size - 1) // 2
-        self.proj = nn.Conv3d(
-            in_chans,
-            embed_dim,
-            kernel_size,
-            stride=stride,
-            padding=padding,
-            bias=True,
-            groups=embed_dim,
-        )
-        self.stride = stride
-
-    def forward(self, x, H, W, D):
-        cnn_feat = rearrange(x, "b (h w d) c -> b c h w d", h=H, w=W, d=D).contiguous()
-        if self.stride == 1:
-            out = self.proj(cnn_feat) + cnn_feat
-        else:
-            out = self.proj(cnn_feat)
-        out = rearrange(out, "b c h w d -> b (h w d) c").contiguous()
-        return out
+    def expand_back(self, x, num_dims):
+        return x[..., *[None for _ in range(num_dims)]]
 
 
-class ViT(nn.Module):
+class ViTv1(nn.Module):
     def __init__(
         self,
         embed_dim=768,
@@ -978,7 +986,6 @@ class ViT(nn.Module):
                 1, np.prod(self.n_patches), embed_dim
             )  # extra dim at front for batch
         )
-        # self.positional_encoding = PEG(embed_dim, embed_dim)
 
         self.register_tokens = nn.Parameter(torch.randn(num_registers, embed_dim))
 
@@ -986,7 +993,7 @@ class ViT(nn.Module):
 
         self.blocks = nn.Sequential(
             *[
-                ComplicatedTransformerBlock(
+                TransformerBlockv1(
                     num_heads,
                     embed_dim,
                     mlp_ratio,
@@ -1006,13 +1013,6 @@ class ViT(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-
-        # n_patches = tuple(
-        #     [x.shape[2 + d] // self.patch_size[d] for d in range(self.spatial_dims)]
-        # )
-
-        # # split into patches
-        # x = self.to_patch(x)  # (b, n_patches, pixels_per_patch)
 
         # x = einsum(x, self.input_head_weights, "b c1 h w, c1 c2 -> b c2 h w")
         x = self.input_head(x)
@@ -1038,15 +1038,6 @@ class ViT(nn.Module):
         x = self.blocks(x)  # (batch, sequence_length, embed_dim)
 
         x, _ = unpack(x, pack_info, "b * d")
-
-        # # pass through first transformer block
-        # x = self.blocks[0](x)
-
-        # # # add PEG encoding
-        # # x = x + self.positional_encoding(x, *n_patches, 1)
-
-        # # pass through remaining transformer blocks
-        # x = self.blocks[1:](x)
 
         # normalize
         x = self.norm(x)  # (batch, sequence_length, embed_dim)
@@ -1094,7 +1085,7 @@ class MAE(nn.Module):
         self.encoder_to_decoder = nn.Linear(self.vit.embed_dim, self.decoder_dim)
         self.decoder = nn.Sequential(
             *[
-                ComplicatedTransformerBlock(
+                TransformerBlockv1(
                     num_heads=decoder_num_heads,
                     embed_dim=decoder_dim,
                     mlp_ratio=4,
