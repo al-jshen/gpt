@@ -1257,7 +1257,14 @@ class LightningWrapper(pl.LightningModule):
 
         self.modelclass = modelclass
 
-        del_keys = ["lr", "loss_fn", "loss_mod", "loss_mod_args", "logging"]
+        del_keys = [
+            "lr",
+            "loss_fn",
+            "loss_mod",
+            "loss_mod_args",
+            "logging",
+            "warmup_steps",
+        ]
         inner_kwargs = {k: v for k, v in kwargs.items() if k not in del_keys}
 
         # build model
@@ -1337,11 +1344,11 @@ class LightningWrapper(pl.LightningModule):
             optimizer,
             [
                 optim.lr_scheduler.LinearLR(
-                    optimizer, start_factor=1e-3, total_iters=self.warmup_steps
+                    optimizer, start_factor=1e-3, total_iters=self.warmup_steps or 1000
                 ),
                 optim.lr_scheduler.ConstantLR(optimizer, factor=1),
             ],
-            milestones=[self.warmup_steps],
+            milestones=[self.warmup_steps or 1000],
         )
         scheduler = {
             "scheduler": lr_scheduler,
